@@ -1,0 +1,19 @@
+[package]
+name = "client_mod_loader"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+# The output DLL must be renamed to xinput1_3.dll before deployment.
+# Build it then: cp target/.../client_mod_loader.dll .../Binaries/Win64/xinput1_3.dll
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "libloaderapi",
+    "sysinfoapi",
+    "minwindef",
+    "processenv",
+] }
+libloading = "0.8"
+glob = "0.3"

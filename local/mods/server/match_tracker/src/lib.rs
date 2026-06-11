@@ -1,122 +1,197 @@
 use std::ffi::c_void;
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Sender};
+use std::sync::OnceLock;
 use std::thread;
 use std::panic;
 use std::io::{Read, Write};
+use retour::static_detour;
 use game_base::*;
+use ue_types::*;
 
 mod match_state;
 use match_state::*;
 
-static MOD_NAME: &'static str = "match_tracker";
+static MOD_NAME: &str = "match_tracker";
+
+// Channel sender shared between all game-thread hooks.
+// Populated once in mod_main_sync before any hooks fire.
+static EVENT_TX: OnceLock<Sender<StateEvent>> = OnceLock::new();
+
+fn tx() -> &'static Sender<StateEvent> {
+    EVENT_TX.get().expect("EVENT_TX not initialized")
+}
+
+// ── Hook: AGameModeBase::RestartPlayer ────────────────────────────────────────
+// Fires on the game thread when a player spawns or respawns.
+// Reading APlayerState here is safe — we're on the same thread that owns it.
+
+static_detour! {
+    static RestartPlayer: fn(*const AGameModeBase, *const APlayerController);
+}
+
+unsafe fn hook_restart_player(
+    this: *const AGameModeBase,
+    controller: *const APlayerController,
+) {
+    // Call through first so the player is fully initialized when we read them
+    RestartPlayer.call(this, controller);
+
+    // Collect player data on the game thread — no background thread touches UE4 memory
+    if let Some(game_mode) = GameMode::mode() {
+        let state_opt = game_mode.state();
+        let players = game_mode.players();
+
+        // Find the player matching this controller by checking the player array.
+        // Send a FullRefresh so the writer has the authoritative list after each spawn.
+        let player_list: Vec<match_state::Player> = players.iter().map(|p| match_state::Player {
+            username:     p.player_name.to_string(),
+            id:           p.player_id.to_native(),
+            ping:         p.exact_ping.to_native(),
+            is_inactive:  p.flags.b_is_inactive(),
+            is_spectator: p.flags.b_is_spectator(),
+            is_bot:       p.flags.b_is_a_bot(),
+        }).collect();
+
+        let (phase, map, start_time) = state_opt.map(|s| (
+            s.match_phase.to_string(),
+            GameWorld::world()
+                .and_then(|w| w.base())
+                .map(|b| b.url.map.to_string())
+                .unwrap_or_default(),
+            s.match_start_time.to_native(),
+        )).unwrap_or_default();
+
+        let _ = tx().send(StateEvent::FullRefresh(player_list, phase, map, start_time));
+    }
+}
+
+// ── Hook: AGameMode::Logout ───────────────────────────────────────────────────
+// TODO: find the offset for Logout in offsets_server.rs (same process used to
+//       find RestartPlayer at 0x233CE50). Add it to GameOffsets and wire it here.
+//
+// static_detour! {
+//     static Logout: fn(*const AGameModeBase, *const AController);
+// }
+//
+// unsafe fn hook_logout(this: *const AGameModeBase, exiting: *const AController) {
+//     // Read the player name BEFORE calling through — after logout the state is gone
+//     let username = /* read from exiting->PlayerState->PlayerName */;
+//     Logout.call(this, exiting);
+//     let _ = tx().send(StateEvent::PlayerLeft(username));
+// }
+
+// ── Hook: AGameMode::SetMatchState ────────────────────────────────────────────
+// TODO: find the offset for SetMatchState.
+//
+// static_detour! {
+//     static SetMatchState: fn(*const AGameModeBase, *const FName);
+// }
+//
+// unsafe fn hook_set_match_state(this: *const AGameModeBase, new_state: *const FName) {
+//     SetMatchState.call(this, new_state);
+//     if let Some(game_mode) = GameMode::mode() {
+//         let state_opt = game_mode.state();
+//         let (phase, map, start_time) = ...;
+//         let _ = tx().send(StateEvent::PhaseChanged { new_phase: phase, map, start_time });
+//     }
+// }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
 fn mod_main_sync(base_addr: *const c_void) {
     unsafe { game_base::OFFSETS = game_base::offsets_server::get_offsets() };
     GameBase::initialize(MOD_NAME, base_addr);
 
-    println!("Starting Match Tracker....");
+    println!("[match_tracker] Starting...");
 
-    thread::spawn(|| {
-        listen_for_connections();
-    });
+    // Channel: game-thread hooks → background file writer
+    let (tx, rx) = mpsc::channel::<StateEvent>();
+    EVENT_TX.set(tx).expect("EVENT_TX already set");
 
-    println!("Match Tracker started!!");
+    // Background thread: owns MatchState, writes file, updates TCP cache.
+    // Never reads UE4 memory.
+    thread::spawn(move || match_state::run_writer(rx));
+
+    // Wire RestartPlayer hook (game thread)
+    unsafe {
+        let restart_player_fn: fn(*const AGameModeBase, *const APlayerController) =
+            std::mem::transmute(GameBase::singleton().at_offset(0x233CE50));
+        RestartPlayer
+            .initialize(restart_player_fn, |this, controller| {
+                hook_restart_player(this, controller);
+            })
+            .expect("Failed to hook RestartPlayer");
+        RestartPlayer.enable().expect("Failed to enable RestartPlayer hook");
+    }
+
+    // TCP listener stays for debug/tooling use (get_players now reads from cache, not UE4)
+    thread::spawn(|| listen_for_connections());
+
+    println!("[match_tracker] Ready. Hooks live, writer thread running.");
 }
+
+// ── TCP debug interface ───────────────────────────────────────────────────────
 
 const MESSAGE_SIZE: usize = 1;
 
 fn handle_client(mut stream: TcpStream) {
     loop {
         let message = read_message(&mut stream);
-        if !message.is_ok() { break };
+        if message.is_err() { break; }
 
-        let message = message.unwrap();
-        match message.trim() {
+        match message.unwrap().trim() {
             "" => (),
-            
-            "quit" => {
-                println!("Client disconnected...");
-                break;
-            },
+            "quit" => break,
 
             "get_key_addresses" => {
-                stream.write(format!("WORLD PROXY: {:p}\n", WorldProxy::proxy().expect("No World Proxy...")).as_bytes()).expect("Tried to write to TCP Stream");
-                stream.write(format!("WORLD: {:p}\n", WorldProxy::world().expect("No World...")).as_bytes()).expect("Tried to write to TCP Stream");
-                stream.write(format!("LEVEL: {:p}\n", WorldProxy::level().expect("No Level...")).as_bytes()).expect("Tried to write to TCP Stream");
-                stream.write(format!("GAME INSTANCE: {:p}\n", GameInstance::instance().expect("No Game Instance...").base().unwrap()).as_bytes()).expect("Tried to write to TCP Stream");
+                let _ = stream.write(format!("WORLD PROXY: {:p}\n", WorldProxy::proxy().expect("No World Proxy")).as_bytes());
+                let _ = stream.write(format!("WORLD: {:p}\n",       WorldProxy::world().expect("No World")).as_bytes());
+                let _ = stream.write(format!("LEVEL: {:p}\n",       WorldProxy::level().expect("No Level")).as_bytes());
+                let _ = stream.write(format!("GAME INSTANCE: {:p}\n", GameInstance::instance().expect("No Game Instance").base().unwrap()).as_bytes());
                 break;
-            },
+            }
 
             "get_players" => {
-                let match_state = get_match_state();
-                let json_str = serde_json::to_string(&match_state).unwrap();
-
-                stream.write(json_str.as_bytes()).expect("Tried to write to TCP Stream");
-                stream.write(b"\n").expect("Tried to write to TCP Stream");
+                // Reads from our own Mutex cache — zero UE4 memory access
+                let state = get_match_state();
+                let json = serde_json::to_string(&state).unwrap_or_default();
+                let _ = stream.write(json.as_bytes());
+                let _ = stream.write(b"\n");
                 break;
-            },
+            }
 
             msg => {
-                println!("Unknown Message: {msg}");
+                println!("[match_tracker] Unknown command: {msg}");
                 break;
             }
         }
     }
 }
 
-
 fn read_message(stream: &mut TcpStream) -> Result<String, std::string::FromUtf8Error> {
-    // Store all the bytes for our received String
     let mut received: Vec<u8> = vec![];
-
-    // Array with a fixed size
     let mut rx_bytes = [0u8; MESSAGE_SIZE];
     loop {
-        // Read from the current data in the TcpStream
-        let bytes_read = stream.read(&mut rx_bytes);
-        if !bytes_read.is_ok() { break };
-        let bytes_read = bytes_read.unwrap();
-
-        // let recv_len = received.len();
-
-        if rx_bytes == "\n".as_bytes() {
-            break;
-        }
-
-        // However many bytes we read, extend the `received` string bytes
-        received.extend_from_slice(&rx_bytes[..bytes_read]);
-
-        // If we didn't fill the array
-        // stop reading because there's no more data (we hope!)
-        if bytes_read < MESSAGE_SIZE {
-            break;
-        }
+        let n = stream.read(&mut rx_bytes);
+        if n.is_err() { break; }
+        let n = n.unwrap();
+        if rx_bytes[0] == b'\n' { break; }
+        received.extend_from_slice(&rx_bytes[..n]);
+        if n < MESSAGE_SIZE { break; }
     }
-
     String::from_utf8(received)
 }
 
 fn listen_for_connections() {
-    println!("Starting TCP Listener...");
-    let listener = TcpListener::bind("0.0.0.0:4951").expect("Could not open TCP Port");
-    println!("Waiting for TCP Connections...");
-
-    // accept connections and process them serially
+    let listener = TcpListener::bind("0.0.0.0:4951").expect("Could not open TCP port 4951");
+    println!("[match_tracker] TCP debug interface on :4951");
     for stream in listener.incoming() {
-        println!("New TCP Connection...");
-
-        match stream {
-            Ok(stream) => {
-                thread::spawn(|| {
-                    panic::catch_unwind(|| {
-                        handle_client(stream);
-                        println!("Ending TCP Connection...");
-                    })
-                });
-            },
-
-            _ => ()
-        };
+        if let Ok(stream) = stream {
+            thread::spawn(|| {
+                panic::catch_unwind(|| handle_client(stream));
+            });
+        }
     }
 }

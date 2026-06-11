@@ -3,7 +3,9 @@ resolver = "2"
 
 members = [
     "mod_loader",
+    "client_mod_loader",
     "mods/client/asset_buddy",
+    "mods/client/auth_injector",
     "mods/client/pathfinder",
     "mods/client/modding_debugger",
     "mods/client/tdm_helper",
