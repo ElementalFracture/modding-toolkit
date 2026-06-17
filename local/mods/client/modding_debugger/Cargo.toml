@@ -12,3 +12,4 @@ ue_types = { workspace = true }
 game_base = { workspace = true }
 injection_utils = { workspace = true }
 utils = { workspace = true }
+ctor = "0.2"

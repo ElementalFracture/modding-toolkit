@@ -1,38 +1,3 @@
-/**
- * auth_injector — Elemental Fracture client auth mod
- *
- * Reads a token from  <GameDir>/Mods/commands/auth_token.txt  and injects it
- * into the outgoing UDP join packet so the elefrac proxy can identify and
- * authenticate the player.
- *
- * How it works
- * ------------
- * Vanilla Spellbreak encodes its join URL with each ASCII byte doubled (×2).
- * After the URL, the same 2×-encoded section contains the hardware UID:
- *   ComputerName-<32 uppercase hex chars>
- * separated from other segments by null bytes.
- *
- * This mod hooks `sendto` (ws2_32.dll) and, on every outgoing UDP packet,
- * finds that UID segment by scanning for the pattern:
- *   [any bytes][0x5A = 2×'-'][32 bytes that are all 2×-encoded hex chars][0x00]
- *
- * It then overwrites the ENTIRE segment (computer name + dash + hex suffix)
- * with the first 32 bytes of the token (2×-encoded), zeroing the remainder.
- * The Name field is left completely untouched — the player's Steam name
- * propagates through unchanged and appears in-game as expected.
- *
- * The elefrac proxy reads the 32-char hex value out of the UID slot,
- * matches it as a token prefix against the database, and identifies the
- * player without touching the Name field at all.
- *
- * Token file
- * ----------
- * Place the token issued by the Discord bot in:
- *   <GameDir>/Mods/commands/auth_token.txt
- * One token per file, leading/trailing whitespace is stripped.
- * Delete or empty the file to connect without authentication.
- */
-
 use std::ffi::c_void;
 use std::fs;
 use std::fs::OpenOptions;
@@ -103,9 +68,6 @@ fn find_uid_segment(data: &[u8], search_start: usize) -> Option<(usize, usize)> 
     None
 }
 
-// sendto from ws2_32.dll.  On x64 Windows all calling conventions are the same,
-// so we can use a plain fn pointer (retour 0.1.0 does not support extern annotations
-// in static_detour!).
 type SendToFn = fn(usize, *const u8, i32, i32, *const u8, i32) -> i32;
 
 static_detour! {
@@ -116,8 +78,6 @@ static_detour! {
 
 #[no_mangle]
 fn mod_main(_base_addr: *const c_void) {
-    // Open our own log file in Mods/dlls/ — UE4 holds the game log with
-    // exclusive write access so we can't append there.
     if let Some(mut p) = install_root() {
         p.push("Mods");
         p.push("dlls");
@@ -151,41 +111,23 @@ fn mod_main(_base_addr: *const c_void) {
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-/// Returns the g3 content directory (.../Spellbreak/g3/).
-fn game_dir() -> Option<PathBuf> {
+fn install_root() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
-    p.pop(); // removes g3.exe
+    p.pop(); // g3-Win64-Test.exe / g3.exe
     p.pop(); // Win64
     p.pop(); // Binaries
-    Some(p)
-}
-
-/// Returns the Spellbreak install root (.../Spellbreak/).
-fn install_root() -> Option<PathBuf> {
-    let mut p = game_dir()?;
     p.pop(); // g3
     Some(p)
 }
 
-fn token_path() -> Option<PathBuf> {
+fn load_token() -> Option<Vec<u8>> {
     let mut p = install_root()?;
     p.push("Mods");
     p.push("commands");
     p.push("auth_token.txt");
-    Some(p)
-}
-
-/// Finds the most-recently-modified g3-*.log in Saved/Logs/ — the same glob
-/// the elefrac supervisor uses on the server side.
-
-fn load_token() -> Option<Vec<u8>> {
-    let path = token_path()?;
-    let raw = fs::read_to_string(&path).ok()?;
+    let raw = fs::read_to_string(&p).ok()?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // log! not available yet when load_token() first runs — println is fine here
+    if trimmed.is_empty() { return None; }
     Some(trimmed.as_bytes().to_vec())
 }
 
@@ -219,7 +161,6 @@ fn hooked_sendto(
     tolen: i32,
 ) -> i32 {
     if len > 0 && !buf.is_null() {
-        // Work on a copy to avoid mutating the caller's buffer.
         let mut data = unsafe { std::slice::from_raw_parts(buf, len as usize) }.to_vec();
         if try_inject_token(&mut data) {
             return SendToHook.call(s, data.as_ptr(), len, flags, to, tolen);
@@ -230,13 +171,6 @@ fn hooked_sendto(
 
 // ── Token injection ───────────────────────────────────────────────────────────
 
-/// Finds the 2×-encoded hardware UID segment in `data` and overwrites it
-/// with the first 32 bytes of the token (each byte doubled), zeroing the
-/// remainder of the slot.  The Name field is left completely untouched.
-///
-/// The server reads the 32 2×-encoded hex chars out of the UID field,
-/// decodes them, and matches the result as a token prefix against the DB.
-/// Returns true if a replacement was made.
 fn try_inject_token(data: &mut Vec<u8>) -> bool {
     let token = match TOKEN.get() {
         Some(t) => t,
@@ -247,7 +181,6 @@ fn try_inject_token(data: &mut Vec<u8>) -> bool {
         return false;
     }
 
-    // Locate the 2×-encoded /Game/Maps/ header.
     let header_pos = match data
         .windows(ENCODED_HEADER.len())
         .position(|w| w == ENCODED_HEADER)
@@ -256,24 +189,22 @@ fn try_inject_token(data: &mut Vec<u8>) -> bool {
         None => return false,
     };
 
-    // Find the UID segment after the header.
     let (seg_start, seg_end) = match find_uid_segment(data, header_pos + ENCODED_HEADER.len()) {
         Some(pair) => pair,
         None => return false,
     };
     let seg_len = seg_end - seg_start;
 
-    // Write the first 32 token chars (2×-encoded) into the slot start.
+    // Write 32 2×-encoded token bytes into the UID slot; zero the rest.
     for i in 0..32 {
         data[seg_start + i] = token[i].wrapping_mul(2);
     }
-    // Zero out the rest of the original slot (removes the computer name).
     for i in 32..seg_len {
         data[seg_start + i] = 0x00;
     }
 
     let preview = std::str::from_utf8(&token[..8]).unwrap_or("?");
-    log!("Injected token {preview}... into UID slot (32/{seg_len} bytes, 2x-enc)");
+    log!("Injected token {preview}... ({}/{}  bytes, 2x-enc)", 32, seg_len);
 
     true
 }

@@ -1,0 +1,13 @@
+[package]
+name = "server_router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+game_base = { workspace = true }
+ue_types = { workspace = true }
+utils = { workspace = true }
+retour = "0.1.0"
