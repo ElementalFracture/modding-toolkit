@@ -13,4 +13,4 @@ retour = "0.1.0"
 simple_endian = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["memoryapi", "winnt", "minwindef"] }
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "minwindef", "winuser"] }

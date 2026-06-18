@@ -6,20 +6,34 @@ static HANDLE g_ready_evt = NULL;
 typedef void (*CommandDispatchFn)(const unsigned short *cmd, int len);
 static CommandDispatchFn g_command_cb = NULL;
 
-/* Private messages posted by devmenu_show/hide from arbitrary threads.
-   PostMessage is non-blocking and never pumps the caller's message queue,
-   avoiding re-entrancy when called from inside a vtable hook. */
-#define WM_DM_SHOW (WM_USER + 1)
-#define WM_DM_HIDE (WM_USER + 2)
+#define ID_BTN_START_MATCH  101
+#define ID_EDIT_CMD         102
+#define ID_BTN_RUN          103
+
+static void dispatch(const wchar_t *cmd, int len)
+{
+    if (g_command_cb)
+        g_command_cb((const unsigned short *)cmd, len);
+}
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
-    case WM_DM_SHOW:
-        ShowWindow(hwnd, SW_SHOW);
-        return 0;
-    case WM_DM_HIDE:
-        ShowWindow(hwnd, SW_HIDE);
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_BTN_START_MATCH:
+            dispatch(L"StartMatch", 10);
+            break;
+        case ID_BTN_RUN: {
+            HWND edit = GetDlgItem(hwnd, ID_EDIT_CMD);
+            wchar_t buf[512] = {0};
+            int len = GetWindowTextW(edit, buf, 512);
+            if (len > 0)
+                dispatch(buf, len);
+            SetWindowTextW(edit, L"");
+            break;
+        }
+        }
         return 0;
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
@@ -48,16 +62,32 @@ static DWORD WINAPI window_thread(LPVOID param)
         L"DevMenuWindow",
         L"Dev Menu",
         WS_OVERLAPPEDWINDOW,
-        200, 200, 480, 320,
+        200, 200, 480, 200,
         NULL, NULL, hInst, NULL
     );
 
-    CreateWindowW(L"STATIC", L"It works!\nFakeGotoState hook is live.\nTilde is now intercepted.",
-        WS_CHILD | WS_VISIBLE | SS_CENTER,
-        20, 80, 420, 120,
-        g_hwnd, NULL, hInst, NULL);
+    /* ── Match controls ──────────────────────────────────── */
+    CreateWindowW(L"STATIC", L"Match",
+        WS_CHILD | WS_VISIBLE,
+        12, 12, 60, 16, g_hwnd, NULL, hInst, NULL);
 
-    /* Signal devmenu_init() that the window is ready. */
+    CreateWindowW(L"BUTTON", L"Start Match",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        12, 30, 100, 28, g_hwnd, (HMENU)ID_BTN_START_MATCH, hInst, NULL);
+
+    /* ── Free-form command input ─────────────────────────── */
+    CreateWindowW(L"STATIC", L"Command",
+        WS_CHILD | WS_VISIBLE,
+        12, 76, 60, 16, g_hwnd, NULL, hInst, NULL);
+
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        12, 94, 340, 24, g_hwnd, (HMENU)ID_EDIT_CMD, hInst, NULL);
+
+    CreateWindowW(L"BUTTON", L"Run",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        358, 94, 60, 24, g_hwnd, (HMENU)ID_BTN_RUN, hInst, NULL);
+
     SetEvent(g_ready_evt);
 
     MSG msg;
@@ -80,13 +110,13 @@ __declspec(dllexport) void devmenu_init(void)
 __declspec(dllexport) void devmenu_show(void)
 {
     if (g_hwnd)
-        PostMessage(g_hwnd, WM_DM_SHOW, 0, 0);
+        ShowWindow(g_hwnd, SW_SHOW);
 }
 
 __declspec(dllexport) void devmenu_hide(void)
 {
     if (g_hwnd)
-        PostMessage(g_hwnd, WM_DM_HIDE, 0, 0);
+        ShowWindow(g_hwnd, SW_HIDE);
 }
 
 __declspec(dllexport) void devmenu_set_command_callback(CommandDispatchFn cb)
