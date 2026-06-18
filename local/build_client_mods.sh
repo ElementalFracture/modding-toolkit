@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Build all client mod DLLs (Rust) and devmenu_qt.dll (C++ Qt) inside the
-# Humble-ROS2 Distrobox, which has the mingw64 cross-compiler.
+# Build all client mod DLLs (Rust) and devmenu_imgui.dll (C++ ImGui overlay)
+# inside the Humble-ROS2 Distrobox, which has the mingw64 cross-compiler.
 #
 # Run this from the HOST (it wraps distrobox-run automatically):
 #
 #   bash modding-toolkit/local/build_client_mods.sh
 #
 # To build only one component:
-#   bash build_client_mods.sh rust      # Rust DLLs only
-#   bash build_client_mods.sh qt        # devmenu_qt.dll only
+#   bash build_client_mods.sh rust    # Rust DLLs only
+#   bash build_client_mods.sh imgui   # devmenu_imgui.dll only
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QT_UI_DIR="${SCRIPT_DIR}/mods/client/qt_devmenu/qt_ui"
+IMGUI_DIR="${SCRIPT_DIR}/mods/client/devmenu_imgui"
 
 DISTROBOX="Humble-ROS2"
 
@@ -33,14 +33,14 @@ build_rust() {
     echo "==> Rust build done.  DLLs in: ${SCRIPT_DIR}/target/x86_64-pc-windows-gnu/release/"
 }
 
-build_qt() {
-    echo "==> Building devmenu_qt.dll in ${DISTROBOX}…"
+build_imgui() {
+    echo "==> Building devmenu_imgui.dll in ${DISTROBOX}…"
     distrobox-run --name "${DISTROBOX}" -- bash -lc "
         set -euo pipefail
-        cd '${QT_UI_DIR}'
+        cd '${IMGUI_DIR}'
         bash build_mingw.sh 2>&1
     "
-    echo "==> Qt build done.  DLL in: ${QT_UI_DIR}/build/devmenu_qt.dll"
+    echo "==> ImGui overlay build done.  DLL in: ${IMGUI_DIR}/build/devmenu_imgui.dll"
 }
 
 deploy() {
@@ -59,26 +59,26 @@ deploy() {
         done
     fi
 
-    # Qt DLL
-    local QT_DLL="${QT_UI_DIR}/build/devmenu_qt.dll"
-    if [[ -f "${QT_DLL}" ]]; then
-        echo "    devmenu_qt.dll"
-        cp "${QT_DLL}" "${MODS_DIR}/"
+    # ImGui overlay DLL
+    local IMGUI_DLL="${IMGUI_DIR}/build/devmenu_imgui.dll"
+    if [[ -f "${IMGUI_DLL}" ]]; then
+        echo "    devmenu_imgui.dll"
+        cp "${IMGUI_DLL}" "${MODS_DIR}/"
     fi
 
     echo "==> Deploy complete."
 }
 
 case "${COMPONENT}" in
-    rust) build_rust ;;
-    qt)   build_qt   ;;
+    rust)  build_rust  ;;
+    imgui) build_imgui ;;
     all)
         build_rust
-        build_qt
+        build_imgui
         deploy
         ;;
     *)
-        echo "Unknown component '${COMPONENT}'.  Use: rust | qt | all"
+        echo "Unknown component '${COMPONENT}'.  Use: rust | imgui | all"
         exit 1
         ;;
 esac

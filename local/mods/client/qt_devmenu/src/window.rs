@@ -22,7 +22,8 @@
 ///       devmenu_init returns.  When the player submits a command in the window,
 ///       the callback is invoked on the Qt thread with the UTF-16 command text.
 
-type VoidFn       = unsafe extern "C" fn();
+type VoidFn        = unsafe extern "C" fn();
+type SetStaffFn    = unsafe extern "C" fn(i32, *const i8);
 type SetCallbackFn = unsafe extern "C" fn(CommandDispatchFn);
 /// UTF-16 command text dispatched from the Qt window to the Rust side.
 type CommandDispatchFn = unsafe extern "C" fn(cmd: *const u16, len: i32);
@@ -30,8 +31,9 @@ type CommandDispatchFn = unsafe extern "C" fn(cmd: *const u16, len: i32);
 struct QtBridge {
     #[cfg(windows)]
     _lib: winapi::shared::minwindef::HMODULE,
-    show: VoidFn,
-    hide: VoidFn,
+    show:      VoidFn,
+    hide:      VoidFn,
+    set_staff: SetStaffFn,
 }
 
 // SAFETY: written once during init, then read-only.
@@ -58,6 +60,15 @@ pub fn hide() {
     }
 }
 
+pub fn set_staff(is_staff: bool, username: &str) {
+    if let Some(Some(b)) = BRIDGE.get() {
+        // Build a null-terminated C string from the username (ASCII-safe).
+        let mut cstr: Vec<i8> = username.bytes().map(|b| b as i8).collect();
+        cstr.push(0);
+        unsafe { (b.set_staff)(if is_staff { 1 } else { 0 }, cstr.as_ptr()); }
+    }
+}
+
 /// Called from the Qt thread when the player submits a command.
 /// Forwards the UTF-16 text to the UE4 console.
 unsafe extern "C" fn command_dispatch(cmd: *const u16, len: i32) {
@@ -76,9 +87,9 @@ fn load_bridge() -> Option<QtBridge> {
     use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
 
     unsafe {
-        let handle = LoadLibraryA(b"devmenu_qt.dll\0".as_ptr() as *const i8);
+        let handle = LoadLibraryA(b"devmenu_imgui.dll\0".as_ptr() as *const i8);
         if handle.is_null() {
-            utils::warning!("[qt_devmenu]: devmenu_qt.dll not found — Qt window disabled");
+            utils::warning!("[qt_devmenu]: devmenu_imgui.dll not found — overlay disabled");
             return None;
         }
 
@@ -87,7 +98,7 @@ fn load_bridge() -> Option<QtBridge> {
                 let p = GetProcAddress(handle, concat!($name, "\0").as_ptr() as *const i8);
                 if p.is_null() {
                     utils::warning!(
-                        "[qt_devmenu]: devmenu_qt.dll is missing export `{}`",
+                        "[qt_devmenu]: devmenu_imgui.dll is missing export `{}`",
                         $name
                     );
                     return None;
@@ -96,10 +107,11 @@ fn load_bridge() -> Option<QtBridge> {
             }};
         }
 
-        let init_fn:    VoidFn        = std::mem::transmute(sym!("devmenu_init"));
-        let show_fn:    VoidFn        = std::mem::transmute(sym!("devmenu_show"));
-        let hide_fn:    VoidFn        = std::mem::transmute(sym!("devmenu_hide"));
-        let set_cb_fn:  SetCallbackFn = std::mem::transmute(sym!("devmenu_set_command_callback"));
+        let init_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_init"));
+        let show_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_show"));
+        let hide_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_hide"));
+        let set_staff_fn: SetStaffFn   = std::mem::transmute(sym!("devmenu_set_staff"));
+        let set_cb_fn:    SetCallbackFn = std::mem::transmute(sym!("devmenu_set_command_callback"));
 
         // Spin up the Qt event loop; blocks until QApplication + window are ready.
         (init_fn)();
@@ -107,7 +119,7 @@ fn load_bridge() -> Option<QtBridge> {
         // Register the Rust command dispatcher before any show() can be called.
         (set_cb_fn)(command_dispatch);
 
-        Some(QtBridge { _lib: handle, show: show_fn, hide: hide_fn })
+        Some(QtBridge { _lib: handle, show: show_fn, hide: hide_fn, set_staff: set_staff_fn })
     }
 }
 

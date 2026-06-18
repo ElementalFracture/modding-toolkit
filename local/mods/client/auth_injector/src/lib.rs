@@ -68,10 +68,76 @@ fn find_uid_segment(data: &[u8], search_start: usize) -> Option<(usize, usize)> 
     None
 }
 
-type SendToFn = fn(usize, *const u8, i32, i32, *const u8, i32) -> i32;
+type SendToFn   = fn(usize, *const u8, i32, i32, *const u8, i32)  -> i32;
+type RecvFromFn = fn(usize, *mut u8,   i32, i32, *mut u8,   *mut i32) -> i32;
 
 static_detour! {
-    static SendToHook: fn(usize, *const u8, i32, i32, *const u8, i32) -> i32;
+    static SendToHook:   fn(usize, *const u8, i32, i32, *const u8, i32)  -> i32;
+    static RecvFromHook: fn(usize, *mut u8,   i32, i32, *mut u8,   *mut i32) -> i32;
+}
+
+// ── Recvfrom hook ─────────────────────────────────────────────────────────────
+
+fn hooked_recvfrom(
+    s:       usize,
+    buf:     *mut u8,
+    len:     i32,
+    flags:   i32,
+    from:    *mut u8,
+    fromlen: *mut i32,
+) -> i32 {
+    loop {
+        let n = RecvFromHook.call(s, buf, len, flags, from, fromlen);
+        if n <= 0 {
+            return n;
+        }
+        let data = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
+        if let Some(rest) = data.strip_prefix(b"EF_AUTH:") {
+            // Format: EF_AUTH:<t|f>:<username>
+            let is_cheat = rest.first() == Some(&b't');
+            let username = rest.get(2..)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("")
+                .to_owned();
+            write_auth_result(is_cheat, &username);
+            log!("EF_AUTH received: is_cheat={is_cheat} username={username}");
+            // Loop — fetch the next real game packet; this one is consumed.
+            continue;
+        }
+        return n;
+    }
+}
+
+fn write_auth_result(is_cheat: bool, username: &str) {
+    if let Some(mut p) = install_root() {
+        p.push("Mods");
+        p.push("dlls");
+        p.push("auth_result.txt");
+        let content = format!(
+            "IS_CHEAT={}\nUSERNAME={}\n",
+            if is_cheat { "true" } else { "false" },
+            username,
+        );
+        let _ = std::fs::write(&p, content);
+    }
+}
+
+unsafe fn install_recvfrom_hook() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+
+    let module = GetModuleHandleA(b"ws2_32.dll\0".as_ptr() as *const i8);
+    if module.is_null() {
+        return Err("ws2_32.dll not loaded".into());
+    }
+    let addr = GetProcAddress(module, b"recvfrom\0".as_ptr() as *const i8);
+    if addr.is_null() {
+        return Err("recvfrom not found in ws2_32.dll".into());
+    }
+    let fn_ptr: RecvFromFn = std::mem::transmute(addr);
+    RecvFromHook.initialize(fn_ptr, hooked_recvfrom)?;
+    RecvFromHook.enable()?;
+    Ok(())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -105,6 +171,10 @@ fn mod_main(_base_addr: *const c_void) {
         match install_sendto_hook() {
             Ok(()) => log!("sendto hooked — token will be injected on connect"),
             Err(e) => log!("Failed to hook sendto: {e}"),
+        }
+        match install_recvfrom_hook() {
+            Ok(()) => log!("recvfrom hooked — will intercept EF_AUTH response"),
+            Err(e) => log!("Failed to hook recvfrom: {e}"),
         }
     }
 }
