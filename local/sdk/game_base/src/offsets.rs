@@ -26,7 +26,10 @@ pub struct VFTableOffsets {
     pub console_uobject: isize,
     pub apawn_inavagent: isize,
     pub acharacter_inavagent: isize,
-    pub acontroller_inavagent: isize
+    pub acontroller_inavagent: isize,
+    /// Byte offset within the UConsole vtable for FakeGotoState.
+    /// Run `dumpconsole` in the modding_debugger to discover the value.
+    pub console_fake_goto_state: isize,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -59,7 +62,8 @@ impl GameOffsets {
                 console_uobject: 0x0,
                 apawn_inavagent: 0x0,
                 acharacter_inavagent: 0x0,
-                acontroller_inavagent: 0x0
+                acontroller_inavagent: 0x0,
+                console_fake_goto_state: 0x0,
             },
             asset_funcs: AssetFuncOffsets {
                 asset_registry_add_asset_data: 0x0,

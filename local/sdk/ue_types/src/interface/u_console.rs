@@ -50,5 +50,14 @@ impl UConsoleVFTable {
     pub fn output_text(&self) -> *const fn(this: *const UConsole, text: *const FString) {
         unsafe { std::mem::transmute(self.addr.byte_offset(0x258)) }
     }
-    
+
+    /// Return a pointer to the `FakeGotoState` function pointer at `byte_offset`
+    /// within the vtable.  The caller must supply the offset discovered via
+    /// `dumpconsole` (stored in `OFFSETS.vf_tables.console_fake_goto_state`).
+    pub fn fake_goto_state_at(
+        &self,
+        byte_offset: isize,
+    ) -> *const fn(*const UConsole, *const FName) {
+        unsafe { std::mem::transmute(self.addr.byte_offset(byte_offset)) }
+    }
 }

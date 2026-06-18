@@ -11,7 +11,10 @@ impl FNameFuncs for FName {
             std::mem::transmute(GameBase::singleton().at_offset(OFFSETS.base_funcs.fname_to_string))
         };
 
-        let result: Box<FString> = Box::new("".into());
+        // Must start null so the game's FMemory::Free(Data) is a no-op on the
+        // initial empty slot.  Using "".into() leaves a dangling Rust pointer
+        // there which the game then frees — crash.
+        let result: Box<FString> = Box::new(FString::default());
         let result = (to_string_fn)(self, Box::into_raw(result));
         unsafe { Some(*result) }
     }

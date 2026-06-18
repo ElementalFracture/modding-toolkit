@@ -15,6 +15,7 @@ modding-toolkit/
         auth_injector/
         asset_buddy/
         pathfinder/
+        qt_devmenu/       ← replaces tilde dev console with a Qt window
         tdm_helper/
         modding_debugger/
         server_router/    (abandoned)
@@ -79,6 +80,25 @@ Remaps console commands to corrected equivalents, working around command name ch
 - `choosecharacterperk <perk>` — remaps removed perk names to their current equivalents
 - `heal` — applies health and stoneskin gameplay effects
 - `level up` — max-levels all perk trees
+
+### `qt_devmenu`
+
+Replaces the UE4 developer console (tilde `~`) with a Qt `QMainWindow`.
+
+The mod is split into two compiled artifacts:
+
+| Artifact | Language | Role |
+|---|---|---|
+| `qt_devmenu.dll` | Rust | Hooks `UConsole::FakeGotoState`; loads `devmenu_qt.dll` at runtime |
+| `devmenu_qt.dll` | C++ / Qt Widgets | Owns the Qt event loop and the window |
+
+When tilde is pressed the UE4 console is suppressed and the Qt window appears. Commands entered in the window are forwarded to the UE4 console via a registered C callback (`devmenu_set_command_callback`), so all existing console commands continue to work. Escape hides the window.
+
+Build `devmenu_qt.dll` from `mods/client/qt_devmenu/qt_ui/`:
+- Windows: `build_windows.bat` (requires Qt and CMake on PATH)
+- mingw64: `build_mingw.sh`
+
+**Prerequisite**: `offsets.vf_tables.console_fake_goto_state` must be set in `sdk/game_base/src/offsets_client.rs`. Run `dumpconsole` in the `modding_debugger` (via the tilde console) to discover the correct byte offset, then set it there. Until it is set the mod logs a warning and the native console falls through unchanged.
 
 ### `modding_debugger`
 

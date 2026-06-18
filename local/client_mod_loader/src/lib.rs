@@ -202,10 +202,7 @@ pub extern "system" fn DllMain(
     if dw_reason == 1 {
         // DLL_PROCESS_ATTACH — load real XInput immediately, then start mod loader thread.
         unsafe { load_real_xinput(); }
-        thread::spawn(|| {
-            thread::sleep(Duration::from_secs(5));
-            load_client_mods();
-        });
+        thread::spawn(|| load_client_mods());
     }
     1
 }
@@ -222,57 +219,82 @@ fn install_root() -> Option<PathBuf> {
     Some(p)  // → .../Spellbreak/
 }
 
+fn is_self(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("xinput1_3.dll"))
+        .unwrap_or(false)
+}
+
 fn load_client_mods() {
     let root = match install_root() {
         Some(r) => r,
         None => return,
     };
 
-    // Write a debug marker so we can confirm the loader ran.
     let _ = fs::write(root.join("Mods/dlls/client_loader_debug.txt"), b"client_mod_loader ran\n");
 
     let dll_dir = root.join("Mods").join("dlls");
     let pattern = format!("{}/**/*.dll", dll_dir.display());
 
-    let base_addr = unsafe {
-        GetModuleHandleA(std::ptr::null()) as *const c_void
-    };
+    let base_addr = unsafe { GetModuleHandleA(std::ptr::null()) as *const c_void };
 
-    let entries = match glob::glob(&pattern) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    // Phase 1 — load every mod DLL and call mod_main_sync immediately.
+    // Mirrors the server-side mod_loader's load_sync_mods phase.
+    // mod_main_sync is used for hooks that must be installed early
+    // (e.g. modding_debugger's console intercept, asset_buddy's PAK bypass).
+    type ModMainFn = unsafe extern fn(*const c_void);
 
-    for entry in entries {
-        let path = match entry {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+    let entries = glob::glob(&pattern).into_iter().flatten().flatten()
+        .filter(|p| !is_self(p));
 
-        // Skip ourselves if somehow found.
-        if path.file_name().and_then(|n| n.to_str())
-              .map(|n| n.eq_ignore_ascii_case("xinput1_3.dll"))
-              .unwrap_or(false) {
-            continue;
-        }
-
+    for path in entries {
         let lib = match unsafe {
             libloading::os::windows::Library::load_with_flags(
                 &path,
                 libloading::os::windows::LOAD_IGNORE_CODE_AUTHZ_LEVEL,
             )
         } {
-            Ok(l) => l,
+            Ok(l)  => l,
+            Err(e) => {
+                let _ = fs::write(
+                    root.join(format!("Mods/dlls/load_err_{}.txt",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"))),
+                    format!("LoadLibrary failed: {:?}\n", e).as_bytes(),
+                );
+                continue;
+            }
+        };
+
+        if let Ok(sym) = unsafe { lib.get::<ModMainFn>(b"mod_main_sync") } {
+            let _ = std::panic::catch_unwind(|| unsafe { sym(base_addr) });
+        }
+
+        std::mem::forget(lib);
+    }
+
+    // Phase 2 — after the game has had time to initialise, call mod_main.
+    thread::sleep(Duration::from_secs(5));
+
+    let entries = glob::glob(&pattern).into_iter().flatten().flatten()
+        .filter(|p| !is_self(p));
+
+    for path in entries {
+        // LoadLibrary returns the cached handle for an already-loaded DLL.
+        let lib = match unsafe {
+            libloading::os::windows::Library::load_with_flags(
+                &path,
+                libloading::os::windows::LOAD_IGNORE_CODE_AUTHZ_LEVEL,
+            )
+        } {
+            Ok(l)  => l,
             Err(_) => continue,
         };
 
-        // Call mod_main if present.
-        type ModMainFn = unsafe extern fn(*const c_void);
         if let Ok(sym) = unsafe { lib.get::<ModMainFn>(b"mod_main") } {
             let _ = std::panic::catch_unwind(|| unsafe { sym(base_addr) });
         }
 
-        // Keep the library alive by leaking it.
         std::mem::forget(lib);
     }
 }

@@ -1,5 +1,8 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+# Static-link the GCC runtime so the DLLs don't depend on libgcc_s_seh-1.dll,
+# which isn't present in a standard Wine/Proton prefix.
+rustflags = ["-C", "link-arg=-static-libgcc"]
 
 [build]
 target = "x86_64-pc-windows-gnu"

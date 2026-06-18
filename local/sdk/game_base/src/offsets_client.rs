@@ -14,6 +14,7 @@ pub const fn get_offsets() -> GameOffsets {
 
     // VF Tables
     offsets.vf_tables.console_uobject = 0xBF21450;
+    offsets.vf_tables.console_fake_goto_state = 0x02F0; // slot 94 = UConsole::FakeGotoState
     offsets.vf_tables.apawn_inavagent = 0x5a3f380;
     offsets.vf_tables.acharacter_inavagent = 0x5955a38;
     offsets.vf_tables.acontroller_inavagent = 0x599c138;
