@@ -19,7 +19,9 @@ fn mod_main(base_addr: *const c_void) {
         if console.is_some() { console.unwrap().output_text(msg) };
     }));
 
-    injection_utils::hooks::console::add_command_intercept(intercept_console_command).expect(format!("[{}]: Could not intercept Console Commands!", MOD_NAME).as_str());
+    if let Err(e) = injection_utils::hooks::console::add_command_intercept(intercept_console_command) {
+        debug!("[{}]: console intercept failed: {:?}", MOD_NAME, e);
+    }
 }
 
 fn intercept_console_command(_console: Console, cmd: &FString) -> Result<bool, Box<dyn std::error::Error>> {

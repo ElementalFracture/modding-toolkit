@@ -66,8 +66,9 @@ fn mod_main_sync(base_addr: *const c_void) {
             false
         });
 
-        injection_utils::hooks::console::add_command_intercept(intercept_console_command)
-            .expect("[modding_debugger]: Could not intercept console commands");
+        if let Err(e) = injection_utils::hooks::console::add_command_intercept(intercept_console_command) {
+            debug!("[{}]: console intercept failed: {:?}", MOD_NAME, e);
+        }
     });
 }
 

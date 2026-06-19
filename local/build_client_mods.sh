@@ -44,18 +44,30 @@ build_imgui() {
 }
 
 deploy() {
-    local MODS_DIR="/home/doobs/.local/share/Steam/steamapps/common/Spellbreak/Mods/dlls"
+    local GAME_DIR="/home/doobs/.local/share/Steam/steamapps/common/Spellbreak"
+    local MODS_DIR="${GAME_DIR}/Mods/dlls"
+    local WIN64_DIR="${GAME_DIR}/g3/Binaries/Win64"
     mkdir -p "${MODS_DIR}"
 
     echo "==> Deploying to ${MODS_DIR}…"
 
-    # Rust DLLs — copy every cdylib from the release output
     local RELEASE_DIR="${SCRIPT_DIR}/target/x86_64-pc-windows-gnu/release"
     if [[ -d "${RELEASE_DIR}" ]]; then
         for dll in "${RELEASE_DIR}"/*.dll; do
             [[ -e "${dll}" ]] || continue
-            echo "    $(basename "${dll}")"
-            cp "${dll}" "${MODS_DIR}/"
+            local name
+            name="$(basename "${dll}")"
+            # client_mod_loader deploys as the xinput1_3 proxy, not as a mod DLL.
+            # steam_api64 must never be shadowed — the game loads its own copy.
+            if [[ "${name}" == "client_mod_loader.dll" ]]; then
+                echo "    ${name} → Win64/xinput1_3.dll"
+                cp "${dll}" "${WIN64_DIR}/xinput1_3.dll"
+            elif [[ "${name}" == "steam_api64.dll" ]]; then
+                echo "    ${name} (skipped — not a mod DLL)"
+            else
+                echo "    ${name}"
+                cp "${dll}" "${MODS_DIR}/"
+            fi
         done
     fi
 

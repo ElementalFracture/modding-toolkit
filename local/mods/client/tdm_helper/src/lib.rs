@@ -1,7 +1,7 @@
 use game_base::*;
 use std::ffi::c_void;
 use ue_types::*;
-use utils::logln;
+use utils::{debug, logln};
 
 static MOD_NAME: &'static str = "better_commands";
 
@@ -20,7 +20,9 @@ fn mod_main(base_addr: *const c_void) {
         };
     }));
 
-    injection_utils::hooks::console::add_command_intercept(intercept_console_command).expect(format!("[{}]: Could not intercept Console Commands!", MOD_NAME).as_str());
+    if let Err(e) = injection_utils::hooks::console::add_command_intercept(intercept_console_command) {
+        debug!("[{}]: console intercept failed: {:?}", MOD_NAME, e);
+    }
 }
 
 fn intercept_console_command(

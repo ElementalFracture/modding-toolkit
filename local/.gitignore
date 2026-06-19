@@ -22,3 +22,9 @@ Cargo.lock
 
 # Compiled DLLs — these are build outputs, not source
 *.dll
+
+# CMake build tree for the devmenu_imgui C++ overlay
+mods/client/devmenu_imgui/build/
+
+# Vendored crates' own lock files are irrelevant
+vendor/*/Cargo.lock

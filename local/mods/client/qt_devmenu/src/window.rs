@@ -1,29 +1,26 @@
-/// Qt window bridge — loads `devmenu_qt.dll` at runtime and delegates all
-/// GUI work to it via a stable C ABI.
+/// ImGui overlay bridge — loads `devmenu_imgui.dll` at runtime and delegates
+/// all GUI work to it via a stable C ABI.
 ///
-/// The DLL must export four symbols with C linkage:
+/// The DLL must export five symbols with C linkage:
 ///
 ///   void devmenu_init()
-///       Called once on mod load from a background Rust thread.  Blocks until
-///       QApplication + DevMenuWindow are ready, then returns.  Internally it
-///       spawns a dedicated OS thread, creates QApplication + DevMenuWindow
-///       there, and calls QApplication::exec() on that thread.  The window
-///       starts hidden.
+///       Called once on mod load from a background Rust thread.  Hooks the
+///       game's IDXGISwapChain::Present vtable so the overlay renders inside
+///       the game's own frame.  The window starts hidden.
 ///
-///   void devmenu_show()
-///       Make the window visible and raise it.  Thread-safe: uses
-///       QMetaObject::invokeMethod with Qt::QueuedConnection.
+///   void devmenu_show() / devmenu_hide()
+///       Toggle overlay visibility.  Thread-safe (atomic flag).
 ///
-///   void devmenu_hide()
-///       Hide the window.  Same thread-safety guarantee as devmenu_show.
+///   void devmenu_set_staff(int is_staff, int is_dev, const char *username)
+///       Update auth state.  is_staff enables Staff Commands panel;
+///       is_dev enables Dev Settings panel.
 ///
 ///   void devmenu_set_command_callback(fn(cmd: *const u16, len: i32))
-///       Register the Rust command dispatcher.  Called once immediately after
-///       devmenu_init returns.  When the player submits a command in the window,
-///       the callback is invoked on the Qt thread with the UTF-16 command text.
+///       Register the Rust command dispatcher.  Invoked on the render thread
+///       when a command is submitted from the overlay.
 
 type VoidFn        = unsafe extern "C" fn();
-type SetStaffFn    = unsafe extern "C" fn(i32, *const i8);
+type SetStaffFn    = unsafe extern "C" fn(i32, i32, *const i8);
 type SetCallbackFn = unsafe extern "C" fn(CommandDispatchFn);
 /// UTF-16 command text dispatched from the Qt window to the Rust side.
 type CommandDispatchFn = unsafe extern "C" fn(cmd: *const u16, len: i32);
@@ -60,16 +57,21 @@ pub fn hide() {
     }
 }
 
-pub fn set_staff(is_staff: bool, username: &str) {
+pub fn set_staff(is_staff: bool, is_dev: bool, username: &str) {
     if let Some(Some(b)) = BRIDGE.get() {
-        // Build a null-terminated C string from the username (ASCII-safe).
         let mut cstr: Vec<i8> = username.bytes().map(|b| b as i8).collect();
         cstr.push(0);
-        unsafe { (b.set_staff)(if is_staff { 1 } else { 0 }, cstr.as_ptr()); }
+        unsafe {
+            (b.set_staff)(
+                if is_staff { 1 } else { 0 },
+                if is_dev   { 1 } else { 0 },
+                cstr.as_ptr(),
+            );
+        }
     }
 }
 
-/// Called from the Qt thread when the player submits a command.
+/// Called from the render thread when the player submits a command.
 /// Forwards the UTF-16 text to the UE4 console.
 unsafe extern "C" fn command_dispatch(cmd: *const u16, len: i32) {
     if cmd.is_null() || len <= 0 {
@@ -110,10 +112,10 @@ fn load_bridge() -> Option<QtBridge> {
         let init_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_init"));
         let show_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_show"));
         let hide_fn:      VoidFn        = std::mem::transmute(sym!("devmenu_hide"));
-        let set_staff_fn: SetStaffFn   = std::mem::transmute(sym!("devmenu_set_staff"));
+        let set_staff_fn: SetStaffFn    = std::mem::transmute(sym!("devmenu_set_staff"));
         let set_cb_fn:    SetCallbackFn = std::mem::transmute(sym!("devmenu_set_command_callback"));
 
-        // Spin up the Qt event loop; blocks until QApplication + window are ready.
+        // Hook the DXGI Present vtable; returns once the hook is installed.
         (init_fn)();
 
         // Register the Rust command dispatcher before any show() can be called.

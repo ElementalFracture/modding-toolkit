@@ -15,6 +15,10 @@ members = [
     "utils/uasset_editor"
 ]
 
+[patch.crates-io]
+# Vendored retour with thiscall gated to x86 so it compiles on x86_64 nightly.
+retour = { path = "./vendor/retour" }
+
 [workspace.dependencies]
 ue_types = { path = "./sdk/ue_types" }
 injection_utils = { path = "./sdk/injection_utils" }
