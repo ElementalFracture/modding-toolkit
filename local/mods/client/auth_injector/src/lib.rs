@@ -93,14 +93,18 @@ fn hooked_recvfrom(
         }
         let data = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
         if let Some(rest) = data.strip_prefix(b"EF_AUTH:") {
-            // Format: EF_AUTH:<t|f>:<username>
-            let is_cheat = rest.first() == Some(&b't');
-            let username = rest.get(2..)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .unwrap_or("")
-                .to_owned();
-            write_auth_result(is_cheat, &username);
-            log!("EF_AUTH received: is_cheat={is_cheat} username={username}");
+            // Format: EF_AUTH:<cheat>:<dev>:<username>  (legacy: EF_AUTH:<cheat>:<username>)
+            let mut parts = rest.splitn(3, |&b| b == b':');
+            let cheat_part = parts.next().unwrap_or(&[]);
+            let second     = parts.next().unwrap_or(&[]);
+            let third      = parts.next();
+            let (is_cheat, is_dev, username) = if let Some(uname) = third {
+                (cheat_part == b"t", second == b"t", std::str::from_utf8(uname).unwrap_or("").to_owned())
+            } else {
+                (cheat_part == b"t", false, std::str::from_utf8(second).unwrap_or("").to_owned())
+            };
+            write_auth_result(is_cheat, is_dev, &username);
+            log!("EF_AUTH received: is_cheat={is_cheat} is_dev={is_dev} username={username}");
             // Loop — fetch the next real game packet; this one is consumed.
             continue;
         }
@@ -108,14 +112,15 @@ fn hooked_recvfrom(
     }
 }
 
-fn write_auth_result(is_cheat: bool, username: &str) {
+fn write_auth_result(is_cheat: bool, is_dev: bool, username: &str) {
     if let Some(mut p) = install_root() {
         p.push("Mods");
         p.push("dlls");
         p.push("auth_result.txt");
         let content = format!(
-            "IS_CHEAT={}\nUSERNAME={}\n",
+            "IS_CHEAT={}\nIS_DEV={}\nUSERNAME={}\n",
             if is_cheat { "true" } else { "false" },
+            if is_dev   { "true" } else { "false" },
             username,
         );
         let _ = std::fs::write(&p, content);

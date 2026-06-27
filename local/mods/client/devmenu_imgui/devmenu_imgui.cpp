@@ -13,6 +13,38 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 
+// ── Debug log ─────────────────────────────────────────────────────────────────
+
+static void dbg(const char *msg)
+{
+    // Resolve log path once: <game_root>\Mods\dlls\devmenu_debug.txt
+    static char s_path[MAX_PATH] = {};
+    if (!s_path[0]) {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, sizeof(exe));
+        // Walk back past g3.exe, Win64, Binaries, g3 (4 separators)
+        char *p = exe + strlen(exe);
+        for (int n = 0; n < 4 && p > exe; --p)
+            if (*p == '\\') ++n;
+        *(p + 2) = '\0';  // keep up to the separator
+        snprintf(s_path, sizeof(s_path),
+                 "%sMods\\dlls\\devmenu_debug.txt", exe + (exe[0] ? 0 : 0));
+        // Simpler: just use a fixed relative path from CWD as fallback
+        if (s_path[0] == '\0')
+            snprintf(s_path, sizeof(s_path), "devmenu_debug.txt");
+    }
+
+    HANDLE f = CreateFileA(s_path,
+                           FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(f, msg, (DWORD)strlen(msg), &w, nullptr);
+    WriteFile(f, "\r\n", 2, &w, nullptr);
+    CloseHandle(f);
+}
+
 #include "imgui.h"
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
@@ -21,11 +53,14 @@
 
 extern "C" {
     typedef void (*CommandDispatchFn)(const unsigned short *cmd, int len);
+    typedef void (*MenuKeyChangedFn)(unsigned vk, unsigned mods);
     __declspec(dllexport) void devmenu_init();
     __declspec(dllexport) void devmenu_show();
     __declspec(dllexport) void devmenu_hide();
     __declspec(dllexport) void devmenu_set_staff(int is_staff, int is_dev, const char *username);
     __declspec(dllexport) void devmenu_set_command_callback(CommandDispatchFn cb);
+    __declspec(dllexport) void devmenu_get_menu_key(unsigned *vk, unsigned *mods);
+    __declspec(dllexport) void devmenu_set_menu_key_callback(MenuKeyChangedFn cb);
 }
 
 // ── Auth / display state ──────────────────────────────────────────────────────
@@ -62,17 +97,36 @@ static HotkeyDef g_hotkeys[] = {
     { "Drop Secondary Wep",    hk_drop_secondary, 0, 0, 0 },
     { "Drop All (no primary)", hk_drop_all,       0, 0, 0 },
     { "Heal",                  hk_heal,           0, 0, 0 },
+    // Must stay last — index is referenced by k_menu_key_idx.
+    // action=nullptr: toggling is handled by the low-level keyboard hook in
+    // qt_devmenu, not the WndProc hotkey loop.  vk2 is intentionally ignored
+    // for this entry (LL hooks don't support chord keys).
+    { "Open / Close Menu",     nullptr,            0x77 /* F8 */, 0, 0 },
 };
 static const int k_hotkey_count = (int)(sizeof(g_hotkeys) / sizeof(g_hotkeys[0]));
+static const int k_menu_key_idx = k_hotkey_count - 1;
 static int       g_listening_idx = -1;
 static void      save_hotkeys();  // defined after persistence helpers
+
+// Callback invoked (from any thread) whenever the menu key binding changes.
+typedef void (*MenuKeyChangedFn)(unsigned vk, unsigned mods);
+static MenuKeyChangedFn g_menu_key_cb = nullptr;
+
+// ── Stuck-input tracking ──────────────────────────────────────────────────────
+// Bitmask of VKs whose WM_KEYUP was consumed by the overlay (ImGui had keyboard
+// focus so the game never saw the release).  Flushed as synthetic WM_KEYUP
+// messages when the menu closes.
+static uint64_t g_eaten_keyup[4] = {};
+static inline void eaten_set(UINT vk) { if (vk < 256) g_eaten_keyup[vk>>6] |=  (1ULL<<(vk&63)); }
+static inline void eaten_clr(UINT vk) { if (vk < 256) g_eaten_keyup[vk>>6] &= ~(1ULL<<(vk&63)); }
+static inline bool eaten_get(UINT vk) { return vk < 256 && (g_eaten_keyup[vk>>6] & (1ULL<<(vk&63))); }
 
 // ── D3D / ImGui state ─────────────────────────────────────────────────────────
 
 static ID3D11Device           *g_device  = nullptr;
 static ID3D11DeviceContext    *g_context = nullptr;
 static ID3D11RenderTargetView *g_rtv     = nullptr;
-static HWND                    g_hwnd    = nullptr;
+static std::atomic<HWND>       g_hwnd    { nullptr };
 static std::atomic<bool>       g_imgui_ready { false };
 
 // ── Bindable key whitelist ────────────────────────────────────────────────────
@@ -102,11 +156,20 @@ static PresentFn g_orig_present = nullptr;
 
 // ── WndProc hook ─────────────────────────────────────────────────────────────
 
-static WNDPROC g_orig_wndproc = nullptr;
+// Initialized to DefWindowProcW so hooked_wndproc can safely call it before
+// the wndproc-install thread has written the real value.
+static WNDPROC g_orig_wndproc = DefWindowProcW;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 static LRESULT CALLBACK hooked_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    // Spellbreak's UE4 engine injects a synthetic WM_KEYDOWN VK_NUMLOCK on
+    // every mouse click as an internal focus signal.  If it reaches the game's
+    // own key-binding dialog it gets captured as the new binding.  Drop it here
+    // unconditionally — Num Lock is not a bindable game key in Spellbreak.
+    if (msg == WM_KEYDOWN && static_cast<UINT>(wp) == VK_NUMLOCK)
+        return 0;
+
     // Key bind capture — highest priority, fires even when an input field has focus.
     // Only accepts whitelisted VK codes so synthetic engine events (e.g. VK_NUMLOCK)
     // don't accidentally snap up the listener before the user presses a real key.
@@ -120,9 +183,13 @@ static LRESULT CALLBACK hooked_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (GetKeyState(VK_CONTROL) & 0x8000) mods |= 2;
             if (GetKeyState(VK_MENU)    & 0x8000) mods |= 4;
             UINT vk2 = 0;
-            for (UINT k = 1; k < 256 && vk2 == 0; ++k) {
-                if (k != vk && is_bindable_key(k) && (GetKeyState(k) & 0x8000))
-                    vk2 = k;
+            // The menu key entry is handled by a low-level keyboard hook that
+            // doesn't support chord keys — don't capture vk2 for it.
+            if (g_listening_idx != k_menu_key_idx) {
+                for (UINT k = 1; k < 256 && vk2 == 0; ++k) {
+                    if (k != vk && is_bindable_key(k) && (GetKeyState(k) & 0x8000))
+                        vk2 = k;
+                }
             }
             g_hotkeys[g_listening_idx].vk   = vk;
             g_hotkeys[g_listening_idx].mods  = mods;
@@ -142,11 +209,15 @@ static LRESULT CALLBACK hooked_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (msg == WM_INPUT) return 0;
 
         // Block all mouse messages regardless of WantCaptureMouse.
+        // WM_LBUTTONDBLCLK must be here: rapid clicks generate it instead of
+        // the second WM_LBUTTONDOWN, and if it leaks the game sees a press with
+        // no release (WM_LBUTTONUP is also blocked) → stuck attack.
         switch (msg) {
         case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
         case WM_MOUSEWHEEL:
             return 0;
         }
@@ -157,6 +228,9 @@ static LRESULT CALLBACK hooked_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             case WM_KEYDOWN: case WM_KEYUP:
             case WM_SYSKEYDOWN: case WM_SYSKEYUP:
             case WM_CHAR:
+                // Track consumed key-ups so we can re-inject them on menu close.
+                if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                    eaten_set(static_cast<UINT>(wp));
                 return 0;
             }
         }
@@ -248,13 +322,19 @@ static const int k_class_elem[] = {
 
 struct RuneInfo { const char *display; const char *cmd; bool has_tier; };
 static const RuneInfo k_runes[] = {
-    { "Sprint",       "Sprint",       true  },
-    { "Dash",         "Dash",         true  },
-    { "Blink",        "Blink",        false },
-    { "Chronomaster", "Chronomaster", true  },
-    { "Springstep",   "Springstep",   true  },
+    { "Blink",          "Blink",          false },
+    { "Dash",           "Dash",           true  },
+    { "Springstep",     "Springstep",     true  },
+    { "Invisibility",   "Invisibility",   true  },
+    { "Shadowstep",     "Shadowstep",     true  },
+    { "Featherfall",    "Featherfall",    true  },
+    { "Flight",         "Flight",         true  },
+    { "Teleportation",  "Teleportation",  true  },
+    { "Gateway",        "Gateway",        true  },
+    { "Wolf's Blood",   "Wolfsblood",     true  },
+    { "Chronomaster",   "Chronomaster",   true  },
 };
-static const int k_rune_count = 5;
+static const int k_rune_count = 11;
 
 struct EquipInfo { const char *display; const char *cmd_key; int rarity; };  // rarity: 0=Common 1=Uncommon 2=Rare 3=Epic 4=Legendary
 
@@ -264,11 +344,11 @@ static const EquipInfo k_amulets[] = {
     { "Rare Amulet of the Berserker",        "Berserker",      2 },
     { "Amulet of the Vandal",                "Vandal",         2 },
     { "Rare Amulet",                         "Capture",        2 },
-    { "Infected Amulet",                     "Infected",       2 },
-    { "Amulet of Icy Refraction",            "Refraction_Icy", 4 },
-    { "Conflagration Amulet",                "Conflagration",  1 },
+    { "Infected Amulet",                     "Infected",       3 },
+    { "Amulet of Icy Refraction",            "Refraction_Icy", 3 },
+    { "Conflagration Amulet",                "Conflagration",  3 },
     { "Epic Amulet of the Slayer",           "Slayer",         3 },
-    { "Crosswinds Amulet",                   "Crosswinds",     1 },
+    { "Crosswinds Amulet",                   "Crosswinds",     3 },
     { "Earthbind Amulet",                    "Eruption",       3 },
     { "Reactive Amulet",                     "Reactive",       3 },
     { "Epic Amulet of the Mender",           "Mender",         3 },
@@ -283,10 +363,9 @@ static const EquipInfo k_boots[] = {
     { "Legendary Boots",                 "Tier_5",        4 },
     { "Slowfall Boots",                  "Slowfall",      1 },
     { "Boots of the Cat",                "Cat",           1 },
-    { "Boots of the Scribe",             "Scribe",        1 },
+    { "Boots of the Scribe",             "Scribe",        2 },
     { "Rare Boots of the Berserker",     "Berserker",     2 },
     { "Boots of the Mouse",              "Mouse",         2 },
-    { "Padded Boots",                    "Padded",        1 },
     { "Rare Boots of the Spellslinger",  "Spellslinger",  2 },
     { "Epic Boots of the Behemoth",      "Behemoth",      3 },
     { "Epic Boots of the Mender",        "Mender",        3 },
@@ -297,14 +376,14 @@ static const int k_boot_count = (int)(sizeof(k_boots)/sizeof(k_boots[0]));
 
 static const EquipInfo k_belts[] = {
     { "Legendary Belt",                  "Tier_5",          4 },
-    { "Belt of the Wanderer",            "Wanderer",        1 },
-    { "Belt of Constitution",            "Constitution",    0 },
+    { "Belt of the Wanderer",            "Wanderer",        4 },
+    { "Belt of Constitution",            "Constitution",    1 },
     { "Belt of Earth and Wind",          "Earth_Wind",      2 },
     { "Belt of Fire and Ice",            "Fire_Ice",        2 },
     { "Belt of Lightning & Poison",      "Lightning_Poison",2 },
-    { "Belt of Regeneration",            "Regeneration",    1 },
+    { "Belt of Regeneration",            "Regeneration",    2 },
     { "Rare Belt of the Slayer",         "Slayer",          2 },
-    { "Reinforced Belt",                 "Reinforced",      1 },
+    { "Reinforced Belt",                 "Reinforced",      2 },
     { "Epic Belt of the Survivor",       "Survivor",        3 },
     { "Epic Belt of the Mender",         "Mender",          3 },
     { "Epic Belt of the Scribe",         "Scribe",          3 },
@@ -340,35 +419,33 @@ static const int k_class_count = 6;
 struct PerkInfo { const char *display; const char *cmd; int cost; };
 
 // Mind tree — display name, BP_Perk_ suffix, point cost.
-// Last entry (Gilded) is the No-Mind talent.
 static const PerkInfo k_mind_perks[] = {
-    { "Intelligent",   "Intelligent",  2 },
+    { "Intelligent",   "Intelligent",  1 },
     { "Blight",        "Inspired",     2 },
     { "Curious",       "Curious",      2 },
     { "Fellowship",    "Fellowship",   2 },
     { "Specialist",    "Hardened",     2 },
-    { "Ambidextrous",  "Ambidextrous", 2 },
+    { "Ambidextrous",  "Ambidextrous", 3 },
     { "Foresight",     "Foresight",    3 },
     { "Runic Fluency", "Runic_Fluency",4 },
-    { "Gilded",        "Gilded",       4 },  // No Mind talent
 };
-static const int k_mind_count = 9;
+static const int k_mind_count = 8;
 
 // Body tree — last entry (Vital Stone) is the No-Body talent.
 static const PerkInfo k_body_perks[] = {
     { "Tough",       "Tough",       1 },
     { "Scavenging",  "Scavenging",  2 },
     { "Thirsty",     "Thirsty",     2 },
-    { "Vigor",       "Vigor",       2 },
+    { "Vigor",       "Vigor",       4 },
     { "Vampiric",    "Vampiric",    3 },
     { "Fortitude",   "Fortitude",   3 },
     { "Vital Stone", "Vital_Stone", 3 },  // No Body talent
     { "Harmony",     "Harmony",     4 },
-    { "Recovery",    "Recovery",    4 },
+    { "Recovery",    "Recovery",    3 },
 };
 static const int k_body_count = 9;
 
-// Spirit tree — last entry (Focused Mana) is the No-Spirit talent.
+// Spirit tree.
 static const PerkInfo k_spirit_perks[] = {
     { "Escapist",     "Escapist",     1 },
     { "Mystical",     "Mystical",     1 },
@@ -378,9 +455,8 @@ static const PerkInfo k_spirit_perks[] = {
     { "Vivify",       "Athletic",     2 },
     { "Spellslinger", "Spellslinger", 2 },
     { "Recklessness", "Recklessness", 3 },
-    { "Focused Mana", "Focused_Mana", 3 },  // No Spirit talent
 };
-static const int k_spirit_count = 9;
+static const int k_spirit_count = 8;
 
 // ── Rarity combo helper ───────────────────────────────────────────────────────
 
@@ -478,7 +554,7 @@ struct Loadout {
     int  off_elem, off_tier;
     bool has_rune;
     int  rune_idx, rune_tier;
-    int  amulet_idx;      // -1=none, 0=Normal, 1+=named
+    int  amulet_idx;      // -1=none
     int  boots_idx;
     int  belt_idx;
     int  mind_perk;       // -1=none, 0+ index into k_mind_perks
@@ -487,6 +563,11 @@ struct Loadout {
     int  level_ups;
     bool upgrade_mind, upgrade_body, upgrade_spirit;
     char boss_cmd[256];
+    // v2 additions — old save files will mismatch sizeof and be discarded.
+    bool has_primary_tier; // spawn primary gauntlet at a specific tier
+    int  pri_tier;         // 0-4 (Common–Legendary)
+    bool has_offhand2;     // second offhand gauntlet (Spellslinger / future default)
+    int  off2_elem, off2_tier;
 };
 
 static Loadout g_loadouts[10];
@@ -499,6 +580,7 @@ static void reset_loadout_slot(int i)
     snprintf(l.name, sizeof(l.name), "Loadout %d", i + 1);
     l.class_idx  = l.amulet_idx = l.boots_idx = l.belt_idx = -1;
     l.mind_perk  = l.body_perk = l.spirit_perk = -1;
+    l.pri_tier   = l.off2_tier = 4; // default Legendary
 }
 
 static void init_loadouts()
@@ -515,10 +597,21 @@ static void apply_loadout(const Loadout &l)
             "ChooseCharacterClass CharacterClass:BP_CharacterClass_%s",
             k_classes[l.class_idx]);
         dispatch_ascii(buf);
+        // Optionally re-spawn the primary gauntlet at a specific tier.
+        if (l.has_primary_tier) {
+            snprintf(buf, sizeof(buf), "SpawnGauntlet Loot:BP_Item_Weapon_%s_Tier_%d 1",
+                k_elements[k_class_elem[l.class_idx]].cmd, l.pri_tier + 1);
+            dispatch_ascii(buf);
+        }
     }
     if (l.has_offhand) {
         snprintf(buf, sizeof(buf), "SpawnGauntlet Loot:BP_Item_Weapon_%s_Tier_%d 1",
             k_elements[l.off_elem].cmd, l.off_tier + 1);
+        dispatch_ascii(buf);
+    }
+    if (l.has_offhand2) {
+        snprintf(buf, sizeof(buf), "SpawnGauntlet Loot:BP_Item_Weapon_%s_Tier_%d 1",
+            k_elements[l.off2_elem].cmd, l.off2_tier + 1);
         dispatch_ascii(buf);
     }
     if (l.has_rune) {
@@ -552,9 +645,11 @@ static void apply_loadout(const Loadout &l)
     }
     for (int i = 0; i < l.level_ups; ++i)
         dispatch_ascii("LevelUpCharacterClass");
-    if (l.upgrade_mind)   dispatch_ascii("UpgradeCharacterPerk Mind");
-    if (l.upgrade_body)   dispatch_ascii("UpgradeCharacterPerk Body");
-    if (l.upgrade_spirit) dispatch_ascii("UpgradeCharacterPerk Spirit");
+    // UpgradeCharacterPerk advances perk rank by 1 (requires a scroll).
+    // Call 3× to reach max rank (rank 1→4 needs 3 upgrades).
+    if (l.upgrade_mind)   for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Mind");
+    if (l.upgrade_body)   for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Body");
+    if (l.upgrade_spirit) for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Spirit");
     if (l.boss_cmd[0])    dispatch_ascii(l.boss_cmd);
 }
 
@@ -601,7 +696,9 @@ static bool row(int idx, const char *label)
     if (is_sel)
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(45, 65, 125, 210));
     ImGui::TableSetColumnIndex(0);
-    bool clicked = ImGui::Selectable("##s", false,
+    char sel_id[16];
+    snprintf(sel_id, sizeof(sel_id), "##s%d", idx);
+    bool clicked = ImGui::Selectable(sel_id, false,
         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
         ImVec2(0, ImGui::GetFrameHeight()));
     if (clicked) { g_item = idx; g_in_right = true; }
@@ -725,7 +822,7 @@ static void draw_items()
 
     // ── Rune ──
     {
-        const char *rn[5];
+        const char *rn[k_rune_count];
         for (int i = 0; i < k_rune_count; ++i) rn[i] = k_runes[i].display;
 
         ImGui::TableNextRow();
@@ -848,10 +945,11 @@ static void draw_items()
     }
 
     // ── Add Perk (tree-based with cost tracking) ──
+    // Reset then re-apply ALL trees so switching one perk doesn't clobber the others.
     auto perk_add_row = [&](int row_idx, const char *tree_lbl,
                              const char *combo_id, const char *btn_id,
                              const PerkInfo *perks, int count,
-                             int &sel_idx, int &active_idx) {
+                             int &sel_idx, int &active_idx, int tree_idx) {
         ImGui::TableNextRow();
         bool sel = row(row_idx, tree_lbl);
         ImGui::TableSetColumnIndex(1);
@@ -863,20 +961,28 @@ static void draw_items()
         ImGui::Combo(combo_id, &sel_idx, names, count);
         ImGui::SameLine();
         if (ImGui::Button(btn_id, ImVec2(-1, 0)) || (sel && kbd_enter(row_idx))) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "ChooseCharacterPerk CharacterPerk:BP_Perk_%s",
-                perks[sel_idx].cmd);
-            dispatch_ascii(buf);
-            active_idx = sel_idx;  // replace previous selection for this tree
+            dispatch_ascii("ResetCharacterPerks");
+            const PerkInfo *all_trees[] = { k_mind_perks, k_body_perks, k_spirit_perks };
+            int all_active[] = { s_mind_perk_active, s_body_perk_active, s_spirit_perk_active };
+            all_active[tree_idx] = sel_idx;
+            for (int t = 0; t < 3; ++t) {
+                if (all_active[t] >= 0) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "ChooseCharacterPerk CharacterPerk:BP_Perk_%s",
+                        all_trees[t][all_active[t]].cmd);
+                    dispatch_ascii(buf);
+                }
+            }
+            active_idx = sel_idx;
         }
     };
 
     perk_add_row(8,  "Mind Perk",   "##prkm", "Add##pm",
-                 k_mind_perks,   k_mind_count,   s_mind_perk_idx,   s_mind_perk_active);
+                 k_mind_perks,   k_mind_count,   s_mind_perk_idx,   s_mind_perk_active, 0);
     perk_add_row(9,  "Body Perk",   "##prkb", "Add##pb",
-                 k_body_perks,   k_body_count,   s_body_perk_idx,   s_body_perk_active);
+                 k_body_perks,   k_body_count,   s_body_perk_idx,   s_body_perk_active, 1);
     perk_add_row(10, "Spirit Perk", "##prks", "Add##ps",
-                 k_spirit_perks, k_spirit_count, s_spirit_perk_idx, s_spirit_perk_active);
+                 k_spirit_perks, k_spirit_count, s_spirit_perk_idx, s_spirit_perk_active, 2);
 
     // ── Points tracker — derived from active perks, not accumulated ──
     {
@@ -941,7 +1047,12 @@ static void load_loadouts()
     char path[MAX_PATH]; snprintf(path, sizeof(path), "%sdevmenu_loadouts.bin", dir);
     FILE *f = fopen(path, "rb");
     if (!f) return;
-    fread(g_loadouts, sizeof(g_loadouts), 1, f);
+    // Discard file if size doesn't match — struct changed between versions.
+    long sz = 0;
+    if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    rewind(f);
+    if (sz == (long)sizeof(g_loadouts))
+        fread(g_loadouts, sizeof(g_loadouts), 1, f);
     fclose(f);
 }
 
@@ -950,15 +1061,32 @@ static void save_hotkeys()
     char dir[MAX_PATH]; get_dll_dir(dir, sizeof(dir));
     char path[MAX_PATH]; snprintf(path, sizeof(path), "%sdevmenu_hotkeys.bin", dir);
     FILE *f = fopen(path, "wb");
-    if (!f) return;
-    int n = k_hotkey_count;
-    fwrite(&n, sizeof(n), 1, f);
-    for (int i = 0; i < k_hotkey_count; ++i) {
-        fwrite(&g_hotkeys[i].vk,   sizeof(UINT), 1, f);
-        fwrite(&g_hotkeys[i].mods, sizeof(UINT), 1, f);
-        fwrite(&g_hotkeys[i].vk2,  sizeof(UINT), 1, f);
+    if (f) {
+        int n = k_hotkey_count;
+        fwrite(&n, sizeof(n), 1, f);
+        for (int i = 0; i < k_hotkey_count; ++i) {
+            fwrite(&g_hotkeys[i].vk,   sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].mods, sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].vk2,  sizeof(UINT), 1, f);
+        }
+        fclose(f);
+    } else {
+        dbg("save_hotkeys: fopen failed — callback will still fire");
     }
-    fclose(f);
+
+    // Fire callback regardless of file write outcome so the LL hook
+    // always picks up the new key immediately in the current session.
+    {
+        char lbuf[80];
+        snprintf(lbuf, sizeof(lbuf), "save_hotkeys: cb=%p vk=0x%02X mods=%u",
+                 (void*)g_menu_key_cb,
+                 g_hotkeys[k_menu_key_idx].vk,
+                 g_hotkeys[k_menu_key_idx].mods);
+        dbg(lbuf);
+    }
+    if (g_menu_key_cb)
+        g_menu_key_cb(g_hotkeys[k_menu_key_idx].vk,
+                      g_hotkeys[k_menu_key_idx].mods);
 }
 
 static void load_hotkeys()
@@ -1086,6 +1214,14 @@ static void draw_hotkeys()
     ImGui::TableHeadersRow();
 
     for (int i = 0; i < k_hotkey_count; ++i) {
+        // Visual separator between game-command hotkeys and the menu toggle.
+        if (i == k_menu_key_idx) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Spacing();
+            ImGui::TextDisabled("-- Menu --");
+            ImGui::Spacing();
+        }
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::TextUnformatted(g_hotkeys[i].label);
@@ -1187,6 +1323,18 @@ static void draw_loadouts()
         }
     }
 
+    // Primary gauntlet tier (element is fixed by class).
+    if (l.class_idx >= 0) {
+        ImGui::Spacing();
+        ImGui::Checkbox("Primary Tier##lpt", &l.has_primary_tier);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!l.has_primary_tier);
+        rarity_combo("##lptt", &l.pri_tier);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", k_elements[k_class_elem[l.class_idx]].display);
+        ImGui::EndDisabled();
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::TextUnformatted("Items");
@@ -1196,7 +1344,7 @@ static void draw_loadouts()
         ImGui::TableSetupColumn("lbl",  ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthStretch);
 
-        // Offhand Gauntlet
+        // Offhand gauntlet
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::Checkbox("Offhand##loh", &l.has_offhand);
@@ -1210,13 +1358,27 @@ static void draw_loadouts()
             ImGui::EndDisabled();
         }
 
+        // Second offhand gauntlet (Spellslinger / future default)
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Checkbox("Offhand 2##loh2", &l.has_offhand2);
+        ImGui::TableSetColumnIndex(1);
+        {
+            const char *en[6]; for (int i = 0; i < k_elem_count; ++i) en[i] = k_elements[i].display;
+            ImGui::BeginDisabled(!l.has_offhand2);
+            ImGui::SetNextItemWidth(70.0f); ImGui::Combo("##lg3e", &l.off2_elem, en, k_elem_count);
+            ImGui::SameLine();
+            rarity_combo("##lg3t", &l.off2_tier);
+            ImGui::EndDisabled();
+        }
+
         // Rune
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::Checkbox("Rune##lrh", &l.has_rune);
         ImGui::TableSetColumnIndex(1);
         {
-            const char *rn[5]; for (int i = 0; i < k_rune_count; ++i) rn[i] = k_runes[i].display;
+            const char *rn[k_rune_count]; for (int i = 0; i < k_rune_count; ++i) rn[i] = k_runes[i].display;
             ImGui::BeginDisabled(!l.has_rune);
             ImGui::SetNextItemWidth(100.0f); ImGui::Combo("##lrn", &l.rune_idx, rn, k_rune_count);
             if (k_runes[l.rune_idx].has_tier) {
@@ -1486,12 +1648,302 @@ static void draw_dev()
         dispatch_ascii(buf);
     }
 
+    ImGui::EndTable();
+}
+
+// ── UE4 Log viewer ───────────────────────────────────────────────────────────
+
+enum LogLevel { LOG_INFO = 0, LOG_DEBUG = 1, LOG_WARN = 2, LOG_ERROR = 3 };
+
+static LogLevel classify_line(const char *p, int len)
+{
+    auto has = [&](const char *kw) {
+        int klen = (int)strlen(kw);
+        for (int i = 0; i <= len - klen; ++i)
+            if (strncmp(p + i, kw, klen) == 0) return true;
+        return false;
+    };
+    if (has("Error:")  || has("Fatal:"))        return LOG_ERROR;
+    if (has("Warning:"))                         return LOG_WARN;
+    if (has("VeryVerbose:") || has("Verbose:")) return LOG_DEBUG;
+    return LOG_INFO;
+}
+
+static void get_ue4_log_path(char *out, int sz)
+{
+    char base[MAX_PATH];
+    get_dll_dir(base, sizeof(base));
+    int n = (int)strlen(base);
+    if (n > 0 && (base[n-1] == '\\' || base[n-1] == '/')) base[--n] = '\0';
+    // Go up two directories: dlls/ -> Mods/ -> <root>/
+    for (int up = 0; up < 2; ++up) {
+        char *sep = strrchr(base, '\\');
+        if (!sep) sep = strrchr(base, '/');
+        if (sep) *sep = '\0';
+    }
+    snprintf(out, sz, "%s\\g3\\Saved\\Logs\\g3-%lu.log", base, (unsigned long)GetCurrentProcessId());
+}
+
+static bool log_stristr(const char *hay, int hlen, const char *needle)
+{
+    int nlen = (int)strlen(needle);
+    if (!nlen) return true;
+    for (int i = 0; i <= hlen - nlen; ++i) {
+        bool ok = true;
+        for (int j = 0; j < nlen && ok; ++j)
+            ok = tolower((unsigned char)hay[i+j]) == tolower((unsigned char)needle[j]);
+        if (ok) return true;
+    }
+    return false;
+}
+
+static void draw_log()
+{
+    if (!g_is_dev.load()) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.85f, 0.3f, 0.3f, 1.0f), "Authorization required");
+        ImGui::TextDisabled("Developer credentials not verified for this session.");
+        return;
+    }
+
+    static char  s_filter[128]        = {};
+    static bool  s_auto_scroll        = true;
+    static bool  s_lv_info            = true;
+    static bool  s_lv_debug           = true;
+    static bool  s_lv_warn            = true;
+    static bool  s_lv_error           = true;
+    static char  s_log_path[MAX_PATH] = {};
+    static bool  s_path_ready         = false;
+    static char *s_log_buf            = nullptr;
+    static int   s_log_len            = 0;
+    static float s_next_refresh       = -1.0f;
+    static const int k_buf_sz         = 256 * 1024;
+
+    if (!s_path_ready) {
+        get_ue4_log_path(s_log_path, sizeof(s_log_path));
+        s_log_buf    = new char[k_buf_sz];
+        s_log_buf[0] = '\0';
+        s_path_ready = true;
+    }
+
+    float now      = (float)ImGui::GetTime();
+    bool  refreshed = false;
+    if (now >= s_next_refresh) {
+        s_next_refresh = now + 0.5f;
+        FILE *f = fopen(s_log_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long file_sz   = ftell(f);
+            long read_from = file_sz > (k_buf_sz - 1) ? file_sz - (k_buf_sz - 1) : 0;
+            fseek(f, read_from, SEEK_SET);
+            s_log_len = (int)fread(s_log_buf, 1, k_buf_sz - 1, f);
+            s_log_buf[s_log_len] = '\0';
+            fclose(f);
+            // skip partial first line when seeked mid-file
+            if (read_from > 0) {
+                char *nl = (char *)memchr(s_log_buf, '\n', s_log_len);
+                if (nl) {
+                    int skip = (int)(nl + 1 - s_log_buf);
+                    s_log_len -= skip;
+                    memmove(s_log_buf, nl + 1, s_log_len + 1);
+                }
+            }
+            refreshed = true;
+        }
+    }
+
+    ImGui::SetNextItemWidth(240.0f);
+    ImGui::InputText("##logfilter", s_filter, sizeof(s_filter));
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##lf")) s_filter[0] = '\0';
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll##log", &s_auto_scroll);
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh##log")) s_next_refresh = -1.0f;
+
+    // Level filter row
+    ImGui::Spacing();
+    auto lv_toggle = [](const char *lbl, bool &flag, ImVec4 on_col) {
+        ImVec4 col = flag ? on_col : ImVec4(on_col.x*0.35f, on_col.y*0.35f, on_col.z*0.35f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::Checkbox(lbl, &flag);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+    };
+    lv_toggle("INFO##lvi",  s_lv_info,  ImVec4(0.80f, 0.80f, 0.80f, 1.0f));
+    lv_toggle("DEBUG##lvd", s_lv_debug, ImVec4(0.55f, 0.78f, 1.00f, 1.0f));
+    lv_toggle("WARN##lvw",  s_lv_warn,  ImVec4(1.00f, 0.78f, 0.20f, 1.0f));
+    lv_toggle("ERROR##lve", s_lv_error, ImVec4(1.00f, 0.35f, 0.35f, 1.0f));
+    if (ImGui::SmallButton("ALL##lva"))
+        s_lv_info = s_lv_debug = s_lv_warn = s_lv_error = true;
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", s_log_path);
+    ImGui::Spacing();
+
+    ImGui::BeginChild("##logchild", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 1));
+
+    static const ImVec4 k_lv_cols[] = {
+        ImVec4(0.80f, 0.80f, 0.80f, 1.0f),  // INFO
+        ImVec4(0.55f, 0.78f, 1.00f, 1.0f),  // DEBUG
+        ImVec4(1.00f, 0.78f, 0.20f, 1.0f),  // WARN
+        ImVec4(1.00f, 0.35f, 0.35f, 1.0f),  // ERROR
+    };
+    static const bool *k_lv_flags[] = { &s_lv_info, &s_lv_debug, &s_lv_warn, &s_lv_error };
+
+    const char *p   = s_log_buf;
+    const char *end = s_log_buf + s_log_len;
+    while (p < end) {
+        const char *eol      = (const char *)memchr(p, '\n', end - p);
+        int         line_len = eol ? (int)(eol - p) : (int)(end - p);
+        if (line_len > 0) {
+            bool text_ok = !s_filter[0] || log_stristr(p, line_len, s_filter);
+            if (text_ok) {
+                LogLevel lv = classify_line(p, line_len);
+                if (*k_lv_flags[lv]) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, k_lv_cols[lv]);
+                    ImGui::TextUnformatted(p, p + line_len);
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
+        p = eol ? eol + 1 : end;
+    }
+
+    ImGui::PopStyleVar();
+
+    if (s_auto_scroll && refreshed)
+        ImGui::SetScrollHereY(1.0f);
+
+    ImGui::EndChild();
+}
+
+// ── Section: Account Status ───────────────────────────────────────────────────
+
+static void draw_account()
+{
+    ImGui::Spacing();
+
+    EnterCriticalSection(&g_state_cs);
+    char username[256];
+    strncpy(username, g_username, sizeof(username) - 1);
+    username[255] = '\0';
+    LeaveCriticalSection(&g_state_cs);
+
+    if (!username[0]) {
+        ImGui::TextColored(ImVec4(0.85f, 0.3f, 0.3f, 1.0f), "Not connected");
+        ImGui::TextDisabled("Authentication has not completed for this session.");
+        return;
+    }
+
+    const bool is_staff = g_is_staff.load();
+    const bool is_dev   = g_is_dev.load();
+
+    if (!ImGui::BeginTable("##acctbl", 2, ImGuiTableFlags_BordersInnerV)) return;
+    ImGui::TableSetupColumn("lbl", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+    ImGui::TableSetupColumn("val", ImGuiTableColumnFlags_WidthStretch);
+
+    auto info_row = [&](const char *lbl, const char *val) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", lbl);
+        ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(val);
+    };
+
+    info_row("Connected as", username);
+    info_row("Auth method",  "Discord");
+
     ImGui::TableNextRow();
-    row(1, "Teleport");
+    ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Role");
     ImGui::TableSetColumnIndex(1);
-    ImGui::TextDisabled("Press M (map), hold T, click destination");
+    if (is_dev)
+        ImGui::TextColored(ImVec4(1.00f, 0.50f, 0.00f, 1.0f), "Developer");
+    else if (is_staff)
+        ImGui::TextColored(ImVec4(0.50f, 0.85f, 1.00f, 1.0f), "Staff");
+    else
+        ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.0f), "Player");
+
+    // Read token from auth_result.txt on first visit (best-effort, cached).
+    static char s_token[512] = {};
+    static bool s_token_read = false;
+    if (!s_token_read) {
+        char dir[MAX_PATH]; get_dll_dir(dir, sizeof(dir));
+        char apath[MAX_PATH]; snprintf(apath, sizeof(apath), "%sauth_result.txt", dir);
+        FILE *af = fopen(apath, "r");
+        if (af) {
+            char line[512];
+            while (fgets(line, sizeof(line), af)) {
+                char *nl;
+                if ((nl = strchr(line, '\n'))) *nl = '\0';
+                if ((nl = strchr(line, '\r'))) *nl = '\0';
+                if      (strncmp(line, "AUTH_TOKEN=",    11) == 0)
+                    strncpy(s_token, line + 11, sizeof(s_token) - 1);
+                else if (strncmp(line, "DISCORD_TOKEN=", 14) == 0)
+                    strncpy(s_token, line + 14, sizeof(s_token) - 1);
+            }
+            fclose(af);
+        }
+        s_token_read = true;
+    }
+
+    char token_display[32] = "\xe2\x80\x94";  // em dash
+    if (s_token[0]) {
+        int tlen = (int)strlen(s_token);
+        int show = tlen > 6 ? 6 : tlen;
+        memcpy(token_display, s_token, show);
+        snprintf(token_display + show, sizeof(token_display) - show, "...");
+    }
+    info_row("Auth token", token_display);
 
     ImGui::EndTable();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.50f, 0.50f, 0.50f, 1.0f),
+        "Player stats (exiles, wins, etc.)  \xe2\x80\x94  coming soon");
+}
+
+// ── Connection toast ──────────────────────────────────────────────────────────
+
+static std::atomic<float> g_toast_timer    { 0.0f };
+static std::atomic<bool>  g_toast_shown    { false };
+static std::atomic<bool>  g_auth_received  { false };
+static char               g_toast_text[256] = {};
+
+// Renders a fade-in/hold/fade-out notification in the top-left.
+// Must be called between ImGui::NewFrame() and ImGui::Render().
+static void render_toast_window()
+{
+    float t = g_toast_timer.load(std::memory_order_relaxed);
+    if (t <= 0.0f) return;
+
+    const float TOTAL = 4.5f;
+    const float FADE  = 0.5f;
+    float alpha = 1.0f;
+    if (t > TOTAL - FADE) alpha = (TOTAL - t) / FADE;
+    else if (t < FADE)    alpha = t / FADE;
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    ImGui::SetNextWindowBgAlpha(0.82f * alpha);
+    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##toast", nullptr,
+        ImGuiWindowFlags_NoTitleBar    | ImGuiWindowFlags_NoResize  |
+        ImGuiWindowFlags_NoMove        | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoInputs      | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav         | ImGuiWindowFlags_NoDecoration);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.20f, 1.00f, 0.45f, alpha));
+    ImGui::TextUnformatted(g_toast_text);
+    ImGui::PopStyleColor();
+    ImGui::End();
+    ImGui::PopStyleVar();
+
+    float dt = ImGui::GetIO().DeltaTime;
+    float new_t = t - dt;
+    g_toast_timer.store(new_t > 0.0f ? new_t : 0.0f, std::memory_order_relaxed);
 }
 
 // ── Left nav ──────────────────────────────────────────────────────────────────
@@ -1504,16 +1956,18 @@ static void draw_nav()
         "Character",
         "Hotkeys",
         "Loadouts",
+        "Account",
         "Staff Commands",
         "Dev Settings",
+        "UE4 Log",
     };
 
     const bool is_staff = g_is_staff.load();
     const bool is_dev   = g_is_dev.load();
-    const bool authed[] = { true, true, true, true, true, is_staff, is_dev };
+    const bool authed[] = { true, true, true, true, true, true, is_staff, is_dev, is_dev };
 
-    for (int i = 0; i < 7; ++i) {
-        if (i == 5) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
+    for (int i = 0; i < 9; ++i) {
+        if (i == 6) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
 
         bool in_section = g_section == i;
         bool nav_focus  = in_section && !g_in_right;
@@ -1544,8 +1998,10 @@ static int section_item_count()
     case 2: return 8;   // Character: Drop Amulet/Belt/Boots/Rune/Secondary/All, Heal, Die
     case 3: return 0;   // Hotkeys: table-based, no keyboard nav
     case 4: return 0;   // Loadouts: no keyboard nav
-    case 5: return g_is_staff.load() ? 17 : 0;
-    case 6: return g_is_dev.load()   ?  2 : 0;
+    case 5: return 0;   // Account: no keyboard nav
+    case 6: return g_is_staff.load() ? 17 : 0;
+    case 7: return g_is_dev.load()   ?  1 : 0;
+    case 8: return 0;   // UE4 Log: no keyboard nav
     }
     return 0;
 }
@@ -1563,8 +2019,8 @@ static void handle_nav_keys()
     const bool en = ImGui::IsKeyPressed(ImGuiKey_Enter,      false);
 
     if (!g_in_right) {
-        if (dn) g_section = (g_section + 1) % 7;
-        if (up) g_section = (g_section + 6) % 7;
+        if (dn) g_section = (g_section + 1) % 9;
+        if (up) g_section = (g_section + 8) % 9;
         if (rt || en) {
             g_in_right = true;
             g_item = 0;
@@ -1629,14 +2085,18 @@ static void render_frame()
     case 2: draw_char();     break;
     case 3: draw_hotkeys();  break;
     case 4: draw_loadouts(); break;
-    case 5: draw_staff();    break;
-    case 6: draw_dev();      break;
+    case 5: draw_account();  break;
+    case 6: draw_staff();    break;
+    case 7: draw_dev();      break;
+    case 8: draw_log();      break;
     }
     ImGui::EndChild();
 
     ImGui::End();
 
     if (!open) g_show.store(false);
+
+    render_toast_window();
 
     ImGui::Render();
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
@@ -1657,16 +2117,23 @@ static void create_rtv(IDXGISwapChain *swap)
 
 static void init_imgui(IDXGISwapChain *swap)
 {
+    dbg("init_imgui: start");
     swap->GetDevice(__uuidof(ID3D11Device), (void **)&g_device);
+    dbg("init_imgui: GetDevice done");
     g_device->GetImmediateContext(&g_context);
+    dbg("init_imgui: GetImmediateContext done");
     create_rtv(swap);
+    dbg("init_imgui: create_rtv done");
 
     DXGI_SWAP_CHAIN_DESC desc {};
     swap->GetDesc(&desc);
-    g_hwnd = desc.OutputWindow;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "init_imgui: hwnd=%p", (void*)desc.OutputWindow);
+    dbg(buf);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    dbg("init_imgui: ImGui::CreateContext done");
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename  = nullptr;
@@ -1681,14 +2148,15 @@ static void init_imgui(IDXGISwapChain *swap)
     s.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.14f, 0.14f, 0.22f, 1.0f);
     s.Colors[ImGuiCol_ChildBg]       = ImVec4(0.06f, 0.06f, 0.09f, 1.0f);
 
-    ImGui_ImplWin32_Init(g_hwnd);
+    dbg("init_imgui: calling ImGui_ImplWin32_Init");
+    ImGui_ImplWin32_Init(desc.OutputWindow);
+    dbg("init_imgui: ImGui_ImplWin32_Init done");
     ImGui_ImplDX11_Init(g_device, g_context);
+    dbg("init_imgui: ImGui_ImplDX11_Init done");
 
-    g_orig_wndproc = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC,
-                          reinterpret_cast<LONG_PTR>(hooked_wndproc)));
-
+    g_hwnd.store(desc.OutputWindow, std::memory_order_release);
     g_imgui_ready.store(true, std::memory_order_release);
+    dbg("init_imgui: ready");
 }
 
 // ── Present hook ──────────────────────────────────────────────────────────────
@@ -1698,10 +2166,37 @@ static HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swap, UINT sync,
     if (!g_imgui_ready.load(std::memory_order_acquire))
         init_imgui(swap);
 
-    if (g_show.load())
+    // Start the connection toast on the first rendered frame after auth lands.
+    // Deferring to here (rather than devmenu_set_staff) ensures the timer starts
+    // while the game world is visible, not during the loading screen.
+    if (g_imgui_ready.load(std::memory_order_relaxed)
+        && g_auth_received.load(std::memory_order_acquire)
+        && !g_toast_shown.exchange(true, std::memory_order_acq_rel)) {
+        g_toast_timer.store(4.5f, std::memory_order_relaxed);
+        dbg("toast: started");
+    }
+
+    const bool show_menu  = g_show.load();
+    const bool show_toast = g_imgui_ready.load()
+                         && g_toast_timer.load(std::memory_order_relaxed) > 0.0f;
+
+    if (show_menu) {
         render_frame();
-    else if (g_imgui_ready.load())
+    } else if (show_toast) {
+        // Minimal ImGui frame for toast only — no input handling.
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
         ImGui::GetIO().MouseDrawCursor = false;
+        render_toast_window();
+        ImGui::Render();
+        if (g_context && g_rtv) {
+            g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        }
+    } else if (g_imgui_ready.load()) {
+        ImGui::GetIO().MouseDrawCursor = false;
+    }
 
     return g_orig_present(swap, sync, flags);
 }
@@ -1712,6 +2207,10 @@ static bool patch_present(IDXGISwapChain *swap)
 {
     void **vtbl = *reinterpret_cast<void ***>(swap);
     void **slot  = &vtbl[8];
+    // Already hooked (e.g. game created a second swap chain sharing the same vtable).
+    // Don't overwrite g_orig_present with our own hook pointer.
+    if (*slot == reinterpret_cast<void *>(&hooked_present))
+        return true;
     DWORD old;
     if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
         return false;
@@ -1735,9 +2234,15 @@ static CreateSwapChainForHwndFn g_orig_create_sc_hwnd = nullptr;
 static HRESULT STDMETHODCALLTYPE hooked_create_sc(
     IDXGIFactory *fac, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **ppSC)
 {
+    dbg("hooked_create_sc: fired");
     HRESULT hr = g_orig_create_sc(fac, dev, desc, ppSC);
-    if (SUCCEEDED(hr) && ppSC && *ppSC)
+    char buf[128];
+    snprintf(buf, sizeof(buf), "hooked_create_sc: orig hr=0x%08lX", (unsigned long)hr);
+    dbg(buf);
+    if (SUCCEEDED(hr) && ppSC && *ppSC) {
         patch_present(*ppSC);
+        dbg("hooked_create_sc: present patched");
+    }
     return hr;
 }
 
@@ -1746,9 +2251,15 @@ static HRESULT STDMETHODCALLTYPE hooked_create_sc_hwnd(
     const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fdesc,
     IDXGIOutput *output, IDXGISwapChain1 **ppSC)
 {
+    dbg("hooked_create_sc_hwnd: fired");
     HRESULT hr = g_orig_create_sc_hwnd(fac, dev, hwnd, desc, fdesc, output, ppSC);
-    if (SUCCEEDED(hr) && ppSC && *ppSC)
+    char buf[128];
+    snprintf(buf, sizeof(buf), "hooked_create_sc_hwnd: orig hr=0x%08lX", (unsigned long)hr);
+    dbg(buf);
+    if (SUCCEEDED(hr) && ppSC && *ppSC) {
         patch_present(reinterpret_cast<IDXGISwapChain *>(*ppSC));
+        dbg("hooked_create_sc_hwnd: present patched");
+    }
     return hr;
 }
 
@@ -1768,52 +2279,144 @@ static void hook_factory()
     typedef HRESULT (WINAPI *CreateDXGIFactory2Fn)(UINT, REFIID, void **);
     typedef HRESULT (WINAPI *CreateDXGIFactory1Fn)(REFIID, void **);
 
+    dbg("hook_factory: start");
+
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
-    if (!dxgi) return;
+    if (!dxgi) { dbg("hook_factory: LoadLibraryW(dxgi.dll) FAILED"); return; }
+    dbg("hook_factory: dxgi.dll loaded");
 
     auto *cf2 = reinterpret_cast<CreateDXGIFactory2Fn>(
         GetProcAddress(dxgi, "CreateDXGIFactory2"));
     if (cf2) {
+        dbg("hook_factory: CreateDXGIFactory2 found, calling...");
         IDXGIFactory2 *fac = nullptr;
-        if (SUCCEEDED(cf2(0, __uuidof(IDXGIFactory2), reinterpret_cast<void **>(&fac)))) {
+        HRESULT hr = cf2(0, __uuidof(IDXGIFactory2), reinterpret_cast<void **>(&fac));
+        char buf[128];
+        snprintf(buf, sizeof(buf), "hook_factory: CreateDXGIFactory2 hr=0x%08lX fac=%p", (unsigned long)hr, (void*)fac);
+        dbg(buf);
+        if (SUCCEEDED(hr) && fac) {
             void **vtbl = *reinterpret_cast<void ***>(fac);
+            snprintf(buf, sizeof(buf), "hook_factory: vtbl=%p slot10=%p slot15=%p",
+                     (void*)vtbl, vtbl[10], vtbl[15]);
+            dbg(buf);
             patch_vtbl_slot(vtbl, 10,
                 reinterpret_cast<void *>(&hooked_create_sc),
                 reinterpret_cast<void **>(&g_orig_create_sc));
+            dbg("hook_factory: slot 10 (CreateSwapChain) patched");
             patch_vtbl_slot(vtbl, 15,
                 reinterpret_cast<void *>(&hooked_create_sc_hwnd),
                 reinterpret_cast<void **>(&g_orig_create_sc_hwnd));
+            dbg("hook_factory: slot 15 (CreateSwapChainForHwnd) patched");
             fac->Release();
+            dbg("hook_factory: factory released, done");
             return;
         }
     }
 
+    dbg("hook_factory: falling back to CreateDXGIFactory1");
     auto *cf1 = reinterpret_cast<CreateDXGIFactory1Fn>(
         GetProcAddress(dxgi, "CreateDXGIFactory1"));
-    if (!cf1) return;
+    if (!cf1) { dbg("hook_factory: CreateDXGIFactory1 not found"); return; }
     IDXGIFactory1 *fac = nullptr;
-    if (FAILED(cf1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&fac)))) return;
+    if (FAILED(cf1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&fac)))) {
+        dbg("hook_factory: CreateDXGIFactory1 FAILED");
+        return;
+    }
     void **vtbl = *reinterpret_cast<void ***>(fac);
     patch_vtbl_slot(vtbl, 10,
         reinterpret_cast<void *>(&hooked_create_sc),
         reinterpret_cast<void **>(&g_orig_create_sc));
+    dbg("hook_factory: slot 10 (CreateSwapChain) patched via factory1");
     fac->Release();
+    dbg("hook_factory: done (factory1 path)");
+}
+
+// ── WndProc install thread ────────────────────────────────────────────────────
+
+// Waits for init_imgui (render thread) to publish g_hwnd, then installs the
+// WndProc subclass from this independent thread.  This must not run on the
+// render thread — see the comment in init_imgui for the deadlock explanation.
+static DWORD WINAPI wndproc_install_thread(LPVOID)
+{
+    for (int i = 0; i < 300; ++i) {
+        HWND hwnd = g_hwnd.load(std::memory_order_acquire);
+        if (hwnd) {
+            g_orig_wndproc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                                  reinterpret_cast<LONG_PTR>(hooked_wndproc)));
+            return 0;
+        }
+        Sleep(100);
+    }
+    return 0;
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 
 extern "C" void devmenu_init()
 {
+    dbg("devmenu_init: start");
     InitializeCriticalSection(&g_state_cs);
+    dbg("devmenu_init: InitializeCriticalSection done");
     init_loadouts();
+    dbg("devmenu_init: init_loadouts done");
     load_loadouts();
+    dbg("devmenu_init: load_loadouts done");
     load_hotkeys();
+    dbg("devmenu_init: load_hotkeys done");
     hook_factory();
+    dbg("devmenu_init: hook_factory done");
+
+    // Spawn the WndProc installer on a thread that is not part of UE4's
+    // render/game-thread synchronisation pair.
+    HANDLE t = CreateThread(nullptr, 0, wndproc_install_thread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    dbg("devmenu_init: complete");
 }
 
-extern "C" void devmenu_show() { g_show.store(true); }
+extern "C" void devmenu_get_menu_key(unsigned *vk, unsigned *mods)
+{
+    if (vk)   *vk   = g_hotkeys[k_menu_key_idx].vk   ? g_hotkeys[k_menu_key_idx].vk   : 0x77u;
+    if (mods) *mods = g_hotkeys[k_menu_key_idx].mods;
+}
+
+extern "C" void devmenu_set_menu_key_callback(MenuKeyChangedFn cb)
+{
+    g_menu_key_cb = cb;
+}
+
+extern "C" void devmenu_show()
+{
+    g_show.store(true);
+    HWND hwnd = g_hwnd.load();
+    if (hwnd) {
+        // Release all physically-held keys so UE4's raw-input state clears.
+        // (UE4 routes keyboard through WM_INPUT; when we start blocking it the
+        // key-up events never arrive, keeping the game in a "key held" state.)
+        for (UINT vk = 1; vk < 256; vk++)
+            if (GetAsyncKeyState(vk) & 0x8000)
+                PostMessageW(hwnd, WM_KEYUP, vk, 0);
+        PostMessageW(hwnd, WM_LBUTTONUP, 0, 0);
+        PostMessageW(hwnd, WM_RBUTTONUP, 0, 0);
+        PostMessageW(hwnd, WM_MBUTTONUP, 0, 0);
+    }
+}
 extern "C" void devmenu_hide()
 {
+    HWND hwnd = g_hwnd.load();
+    if (hwnd) {
+        // Re-inject any key-ups that were eaten while ImGui had keyboard focus,
+        // and release mouse buttons in case a rapid-click left one stuck.
+        for (UINT vk = 1; vk < 256; vk++) {
+            if (eaten_get(vk)) {
+                PostMessageW(hwnd, WM_KEYUP, vk, 0);
+                eaten_clr(vk);
+            }
+        }
+        PostMessageW(hwnd, WM_LBUTTONUP, 0, 0);
+        PostMessageW(hwnd, WM_RBUTTONUP, 0, 0);
+        PostMessageW(hwnd, WM_MBUTTONUP, 0, 0);
+    }
     g_show.store(false);
     if (g_imgui_ready.load()) ImGui::GetIO().MouseDrawCursor = false;
 }
@@ -1823,10 +2426,23 @@ extern "C" void devmenu_set_staff(int is_staff, int is_dev, const char *username
     g_is_staff.store(is_staff != 0);
     g_is_dev.store(is_dev != 0);
     EnterCriticalSection(&g_state_cs);
-    if (username && username[0])
+    if (username && username[0]) {
         strncpy(g_username, username, sizeof(g_username) - 1);
-    else
+        g_username[255] = '\0';
+        // Prepare toast text; hooked_present will start the countdown once
+        // the renderer is ready, so the toast appears in the game world rather
+        // than expiring during the loading screen.
+        if (!g_toast_shown.load(std::memory_order_relaxed)) {
+            const char *role = is_dev  ? "Developer"
+                             : is_staff ? "Staff"
+                                        : "Player";
+            snprintf(g_toast_text, sizeof(g_toast_text),
+                     "Connected as %s  [%s]", username, role);
+        }
+        g_auth_received.store(true, std::memory_order_release);
+    } else {
         g_username[0] = '\0';
+    }
     LeaveCriticalSection(&g_state_cs);
 }
 

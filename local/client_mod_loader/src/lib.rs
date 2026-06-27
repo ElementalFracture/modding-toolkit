@@ -28,6 +28,7 @@ use std::time::Duration;
 use winapi::{
     shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID},
     um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
+    um::processthreadsapi::CreateThread,
     um::sysinfoapi::GetSystemDirectoryA,
 };
 
@@ -193,6 +194,14 @@ pub unsafe extern "system" fn XInputGetKeystroke(dw_user: DWORD, reserved: DWORD
 
 // ── DllMain ────────────────────────────────────────────────────────────────────
 
+// Thread entry point — runs after DllMain returns and the loader lock is released.
+// LoadLibraryA (called by load_real_xinput and libloading) is safe here.
+unsafe extern "system" fn mod_init_thread(_: LPVOID) -> DWORD {
+    load_real_xinput();
+    load_client_mods();
+    0
+}
+
 #[no_mangle]
 pub extern "system" fn DllMain(
     _h_module: HINSTANCE,
@@ -200,9 +209,19 @@ pub extern "system" fn DllMain(
     _lp_reserved: LPVOID,
 ) -> BOOL {
     if dw_reason == 1 {
-        // DLL_PROCESS_ATTACH — load real XInput immediately, then start mod loader thread.
-        unsafe { load_real_xinput(); }
-        thread::spawn(|| load_client_mods());
+        // DLL_PROCESS_ATTACH — CreateThread is safe from DllMain; do NOT call
+        // LoadLibraryA or thread::spawn (Rust runtime init) here, as both try
+        // to acquire the loader lock that DllMain already holds on native Windows.
+        unsafe {
+            CreateThread(
+                std::ptr::null_mut(),
+                0,
+                Some(mod_init_thread),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+        }
     }
     1
 }
@@ -235,7 +254,9 @@ fn load_client_mods() {
     let _ = fs::write(root.join("Mods/dlls/client_loader_debug.txt"), b"client_mod_loader ran\n");
 
     let dll_dir = root.join("Mods").join("dlls");
-    let pattern = format!("{}/**/*.dll", dll_dir.display());
+    // glob requires forward slashes on all platforms; Windows paths use backslashes.
+    let dll_dir_str = dll_dir.to_string_lossy().replace('\\', "/");
+    let pattern = format!("{}/**/*.dll", dll_dir_str);
 
     let base_addr = unsafe { GetModuleHandleA(std::ptr::null()) as *const c_void };
 

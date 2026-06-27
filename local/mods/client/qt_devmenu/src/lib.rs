@@ -21,7 +21,7 @@ fn mod_main_sync(base_addr: *const c_void) {
         if window::init() {
             debug!("[{}]: devmenu_imgui.dll loaded OK", MOD_NAME);
         } else {
-            warning!("[{}]: devmenu_imgui.dll absent — F8 opens nothing", MOD_NAME);
+            warning!("[{}]: devmenu_imgui.dll absent — menu key opens nothing", MOD_NAME);
         }
 
         match injection_utils::hooks::console_open::suppress_native_console() {
@@ -29,12 +29,18 @@ fn mod_main_sync(base_addr: *const c_void) {
             Err(e)  => warning!("[{}]: console suppression failed — {}", MOD_NAME, e),
         }
 
-        injection_utils::hooks::keyboard::install(
-            injection_utils::hooks::keyboard::VK_F8,
-            on_menu_open,
-            on_menu_close,
-        );
-        debug!("[{}]: F8 keyboard hook installed", MOD_NAME);
+        // Prime auth at game start: triggers the connection toast and arms the
+        // teleport block before the user ever opens the menu.
+        {
+            let (is_cheat, is_dev, username) = read_auth_result();
+            injection_utils::hooks::keyboard::set_block_teleport(!is_cheat && !is_dev);
+            window::set_staff(is_cheat, is_dev, &username);
+        }
+
+        let (vk, mods) = window::get_menu_key();
+        window::set_menu_key_callback(on_menu_key_changed);
+        injection_utils::hooks::keyboard::install(vk, mods, on_menu_open, on_menu_close);
+        debug!("[{}]: keyboard hook installed (vk=0x{:02X} mods={})", MOD_NAME, vk, mods);
     });
 }
 
@@ -45,6 +51,13 @@ fn install_root() -> Option<PathBuf> {
     p.pop(); // Binaries
     p.pop(); // g3
     Some(p)
+}
+
+/// Called by devmenu_imgui.dll (on the render thread) when the user rebinds
+/// the menu toggle key.  Updates the low-level keyboard hook atomically.
+unsafe extern "C" fn on_menu_key_changed(vk: u32, mods: u32) {
+    injection_utils::hooks::keyboard::update_menu_key(vk, mods);
+    debug!("[{}]: menu key updated (vk=0x{:02X} mods={})", MOD_NAME, vk, mods);
 }
 
 fn read_auth_result() -> (bool, bool, String) {
@@ -63,13 +76,14 @@ fn read_auth_result() -> (bool, bool, String) {
 }
 
 fn on_menu_open() {
-    debug!("[{}]: F8 — showing dev menu", MOD_NAME);
+    debug!("[{}]: showing dev menu", MOD_NAME);
     let (is_cheat, is_dev, username) = read_auth_result();
+    injection_utils::hooks::keyboard::set_block_teleport(!is_cheat && !is_dev);
     window::set_staff(is_cheat, is_dev, &username);
     window::show();
 }
 
 fn on_menu_close() {
-    debug!("[{}]: F8 — hiding dev menu", MOD_NAME);
+    debug!("[{}]: hiding dev menu", MOD_NAME);
     window::hide();
 }
