@@ -1863,38 +1863,6 @@ static void draw_account()
     else
         ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.70f, 1.0f), "Player");
 
-    // Read token from auth_result.txt on first visit (best-effort, cached).
-    static char s_token[512] = {};
-    static bool s_token_read = false;
-    if (!s_token_read) {
-        char dir[MAX_PATH]; get_dll_dir(dir, sizeof(dir));
-        char apath[MAX_PATH]; snprintf(apath, sizeof(apath), "%sauth_result.txt", dir);
-        FILE *af = fopen(apath, "r");
-        if (af) {
-            char line[512];
-            while (fgets(line, sizeof(line), af)) {
-                char *nl;
-                if ((nl = strchr(line, '\n'))) *nl = '\0';
-                if ((nl = strchr(line, '\r'))) *nl = '\0';
-                if      (strncmp(line, "AUTH_TOKEN=",    11) == 0)
-                    strncpy(s_token, line + 11, sizeof(s_token) - 1);
-                else if (strncmp(line, "DISCORD_TOKEN=", 14) == 0)
-                    strncpy(s_token, line + 14, sizeof(s_token) - 1);
-            }
-            fclose(af);
-        }
-        s_token_read = true;
-    }
-
-    char token_display[32] = "\xe2\x80\x94";  // em dash
-    if (s_token[0]) {
-        int tlen = (int)strlen(s_token);
-        int show = tlen > 6 ? 6 : tlen;
-        memcpy(token_display, s_token, show);
-        snprintf(token_display + show, sizeof(token_display) - show, "...");
-    }
-    info_row("Auth token", token_display);
-
     ImGui::EndTable();
 
     ImGui::Spacing();

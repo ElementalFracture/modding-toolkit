@@ -1,10 +1,47 @@
 mod window;
 
-use std::ffi::c_void;
-use std::path::PathBuf;
+use std::ffi::{c_void, CStr};
+use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use utils::{debug, warning};
 
 static MOD_NAME: &str = "qt_devmenu";
+
+// In-process auth state — written by mod_receive_auth (called from auth_injector),
+// read by get_auth_state().  Never touches disk.
+static AUTH_IS_CHEAT: AtomicBool   = AtomicBool::new(false);
+static AUTH_IS_DEV:   AtomicBool   = AtomicBool::new(false);
+static AUTH_USERNAME: Mutex<String> = Mutex::new(String::new());
+
+/// Called by auth_injector.dll (via GetProcAddress) when the server's EF_AUTH
+/// packet is intercepted.  Stores the result in memory and applies it immediately.
+#[no_mangle]
+pub unsafe extern "C" fn mod_receive_auth(
+    is_cheat: i32,
+    is_dev: i32,
+    username: *const c_char,
+) {
+    let uname = if username.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(username).to_str().unwrap_or("").to_owned()
+    };
+
+    AUTH_IS_CHEAT.store(is_cheat != 0, Ordering::SeqCst);
+    AUTH_IS_DEV.store(is_dev != 0, Ordering::SeqCst);
+    if let Ok(mut g) = AUTH_USERNAME.lock() { *g = uname.clone(); }
+
+    injection_utils::hooks::keyboard::set_block_teleport(is_cheat == 0 && is_dev == 0);
+    window::set_staff(is_cheat != 0, is_dev != 0, &uname);
+}
+
+fn get_auth_state() -> (bool, bool, String) {
+    let is_cheat = AUTH_IS_CHEAT.load(Ordering::SeqCst);
+    let is_dev   = AUTH_IS_DEV.load(Ordering::SeqCst);
+    let username = AUTH_USERNAME.lock().map(|g| g.clone()).unwrap_or_default();
+    (is_cheat, is_dev, username)
+}
 
 #[no_mangle]
 fn mod_main(_base_addr: *const c_void) {}
@@ -15,8 +52,6 @@ fn mod_main_sync(base_addr: *const c_void) {
     game_base::GameBase::initialize(MOD_NAME, base_addr);
 
     std::thread::spawn(|| {
-        // Hook the DXGI factory vtable before suppress_native_console blocks so
-        // we intercept the game's swap chain creation at T+0, not T+9.
         debug!("[{}]: loading ImGui overlay…", MOD_NAME);
         if window::init() {
             debug!("[{}]: devmenu_imgui.dll loaded OK", MOD_NAME);
@@ -29,10 +64,12 @@ fn mod_main_sync(base_addr: *const c_void) {
             Err(e)  => warning!("[{}]: console suppression failed — {}", MOD_NAME, e),
         }
 
-        // Prime auth at game start: triggers the connection toast and arms the
-        // teleport block before the user ever opens the menu.
+        // Apply whatever auth state we have so far.  If auth_injector hasn't
+        // received the EF_AUTH packet yet the atomics are default (false / ""),
+        // which means: block teleport for safety, no toast yet.  mod_receive_auth
+        // will fire once the server responds and update everything then.
         {
-            let (is_cheat, is_dev, username) = read_auth_result();
+            let (is_cheat, is_dev, username) = get_auth_state();
             injection_utils::hooks::keyboard::set_block_teleport(!is_cheat && !is_dev);
             window::set_staff(is_cheat, is_dev, &username);
         }
@@ -44,40 +81,15 @@ fn mod_main_sync(base_addr: *const c_void) {
     });
 }
 
-fn install_root() -> Option<PathBuf> {
-    let mut p = std::env::current_exe().ok()?;
-    p.pop(); // exe
-    p.pop(); // Win64
-    p.pop(); // Binaries
-    p.pop(); // g3
-    Some(p)
-}
-
-/// Called by devmenu_imgui.dll (on the render thread) when the user rebinds
-/// the menu toggle key.  Updates the low-level keyboard hook atomically.
+/// Called by devmenu_imgui.dll (render thread) when the user rebinds the menu key.
 unsafe extern "C" fn on_menu_key_changed(vk: u32, mods: u32) {
     injection_utils::hooks::keyboard::update_menu_key(vk, mods);
     debug!("[{}]: menu key updated (vk=0x{:02X} mods={})", MOD_NAME, vk, mods);
 }
 
-fn read_auth_result() -> (bool, bool, String) {
-    let path = install_root()
-        .map(|mut p| { p.push("Mods"); p.push("dlls"); p.push("auth_result.txt"); p });
-    let Some(path) = path else { return (false, false, String::new()); };
-    let Ok(contents) = std::fs::read_to_string(&path) else { return (false, false, String::new()); };
-
-    let is_cheat = contents.contains("IS_CHEAT=true");
-    let is_dev   = contents.contains("IS_DEV=true");
-    let username = contents.lines()
-        .find_map(|l| l.strip_prefix("USERNAME="))
-        .unwrap_or("")
-        .to_owned();
-    (is_cheat, is_dev, username)
-}
-
 fn on_menu_open() {
     debug!("[{}]: showing dev menu", MOD_NAME);
-    let (is_cheat, is_dev, username) = read_auth_result();
+    let (is_cheat, is_dev, username) = get_auth_state();
     injection_utils::hooks::keyboard::set_block_teleport(!is_cheat && !is_dev);
     window::set_staff(is_cheat, is_dev, &username);
     window::show();

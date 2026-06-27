@@ -103,7 +103,7 @@ fn hooked_recvfrom(
             } else {
                 (cheat_part == b"t", false, std::str::from_utf8(second).unwrap_or("").to_owned())
             };
-            write_auth_result(is_cheat, is_dev, &username);
+            notify_devmenu(is_cheat, is_dev, &username);
             log!("EF_AUTH received: is_cheat={is_cheat} is_dev={is_dev} username={username}");
             // Loop — fetch the next real game packet; this one is consumed.
             continue;
@@ -112,18 +112,31 @@ fn hooked_recvfrom(
     }
 }
 
-fn write_auth_result(is_cheat: bool, is_dev: bool, username: &str) {
-    if let Some(mut p) = install_root() {
-        p.push("Mods");
-        p.push("dlls");
-        p.push("auth_result.txt");
-        let content = format!(
-            "IS_CHEAT={}\nIS_DEV={}\nUSERNAME={}\n",
-            if is_cheat { "true" } else { "false" },
-            if is_dev   { "true" } else { "false" },
-            username,
-        );
-        let _ = std::fs::write(&p, content);
+// Push auth state directly into qt_devmenu's in-process memory.
+// No file is written — auth never touches disk.
+fn notify_devmenu(is_cheat: bool, is_dev: bool, username: &str) {
+    #[cfg(windows)]
+    unsafe {
+        use std::ffi::CString;
+        use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+
+        type NotifyFn = unsafe extern "C" fn(i32, i32, *const i8);
+
+        let module = GetModuleHandleA(b"qt_devmenu.dll\0".as_ptr() as *const i8);
+        if module.is_null() {
+            log!("notify_devmenu: qt_devmenu.dll not loaded");
+            return;
+        }
+        let proc = GetProcAddress(module, b"mod_receive_auth\0".as_ptr() as *const i8);
+        if proc.is_null() {
+            log!("notify_devmenu: mod_receive_auth not found");
+            return;
+        }
+        let f: NotifyFn = std::mem::transmute(proc);
+        match CString::new(username) {
+            Ok(cname) => f(is_cheat as i32, is_dev as i32, cname.as_ptr()),
+            Err(_)    => log!("notify_devmenu: username contained null byte"),
+        }
     }
 }
 
@@ -159,6 +172,15 @@ fn mod_main(_base_addr: *const c_void) {
     }
 
     log!("Starting...");
+
+    // Remove any auth_result.txt left by older versions — auth state must not live on disk.
+    if let Some(mut p) = install_root() {
+        p.push("Mods"); p.push("dlls"); p.push("auth_result.txt");
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+            log!("Removed stale auth_result.txt");
+        }
+    }
 
     match load_token() {
         Some(token) => {
