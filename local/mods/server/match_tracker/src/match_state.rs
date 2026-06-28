@@ -1,5 +1,10 @@
 use serde::{Serialize, Deserialize};
 use std::fs;
+use std::io::{BufWriter, Write};
+use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct MatchState {
@@ -22,6 +27,8 @@ pub struct Player {
 
 pub const STATE_FILE: &str = "match_state.json";
 const   STATE_FILE_TMP: &str = "match_state.json.tmp";
+
+const PUSH_ADDR: &str = "127.0.0.1:4950";
 
 /// Events the game-thread hooks push into the channel.
 /// The background writer thread owns MatchState and applies these.
@@ -46,16 +53,63 @@ pub enum StateEvent {
 
 /// Background writer thread entry point.
 /// Owns MatchState entirely — never reads UE4 memory.
-pub fn run_writer(rx: std::sync::mpsc::Receiver<StateEvent>) {
+pub fn run_writer(rx: mpsc::Receiver<StateEvent>) {
     let mut state = MatchState::default();
-    state.state = "WaitingForServer".to_string();
+    state.state = "Initializing".to_string();
+
+    // Spawn push thread: connects to Python and sends JSON lines on qualifying events.
+    let (push_tx, push_rx) = mpsc::channel::<String>();
+    thread::spawn(move || maintain_push_connection(push_rx));
 
     for event in rx {
         if apply_event(&mut state, event) {
             update_tcp_cache(&state);
-            write_state_file_inner(&state);
+            write_state_file(&state);
+            if let Ok(json) = serde_json::to_string(&state) {
+                let _ = push_tx.send(json);
+            }
         }
     }
+}
+
+/// Maintains a persistent outbound TCP connection to the Python push receiver.
+/// Reconnects automatically on failure. Drops events that can't be delivered
+/// after one reconnect attempt to avoid unbounded blocking.
+fn maintain_push_connection(rx: mpsc::Receiver<String>) {
+    let mut conn: Option<BufWriter<TcpStream>> = None;
+
+    for json in rx {
+        if !try_send(&mut conn, &json) {
+            // Connection lost — try once to reconnect and resend.
+            conn = try_connect();
+            if !try_send(&mut conn, &json) {
+                conn = None; // Will reconnect on the next event.
+            }
+        }
+    }
+}
+
+fn try_connect() -> Option<BufWriter<TcpStream>> {
+    for attempt in 1u32..=5 {
+        match TcpStream::connect(PUSH_ADDR) {
+            Ok(s) => {
+                println!("[match_tracker] Push connection established to {}", PUSH_ADDR);
+                return Some(BufWriter::new(s));
+            }
+            Err(e) => {
+                println!("[match_tracker] Push connect attempt {}: {}", attempt, e);
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+    }
+    None
+}
+
+fn try_send(conn: &mut Option<BufWriter<TcpStream>>, json: &str) -> bool {
+    let Some(ref mut c) = conn else { return false };
+    c.write_all(json.as_bytes()).is_ok()
+        && c.write_all(b"\n").is_ok()
+        && c.flush().is_ok()
 }
 
 pub fn apply_event(state: &mut MatchState, event: StateEvent) -> bool {
@@ -106,18 +160,15 @@ pub fn apply_event(state: &mut MatchState, event: StateEvent) -> bool {
     }
 }
 
-fn write_state_file_inner(state: &MatchState) {
+fn write_state_file(state: &MatchState) {
     if let Ok(json) = serde_json::to_string_pretty(state) {
-        println!("[match_tracker] writing state:\n{}", json);
         if fs::write(STATE_FILE_TMP, &json).is_ok() {
             let _ = fs::rename(STATE_FILE_TMP, STATE_FILE);
         }
     }
 }
 
-/// TCP fallback: return a snapshot via a shared cache rather than reading UE4 memory.
-/// The cache is updated by the writer thread after each event.
-use std::sync::{Mutex, OnceLock};
+// ── TCP fallback cache (for the debug get_players command on port 4951) ───────
 
 static TCP_CACHE: OnceLock<Mutex<MatchState>> = OnceLock::new();
 

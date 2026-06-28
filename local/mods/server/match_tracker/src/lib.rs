@@ -1,5 +1,7 @@
 use std::ffi::c_void;
+use std::fmt::Write as FmtWrite;
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -17,6 +19,10 @@ static MOD_NAME: &str = "match_tracker";
 // Channel sender shared between all game-thread hooks.
 // Populated once in mod_main_sync before any hooks fire.
 static EVENT_TX: OnceLock<Sender<StateEvent>> = OnceLock::new();
+
+// Fires once on the first RestartPlayer call to dump the GameMode vtable.
+// This lets us locate Logout and SetMatchState by their slots relative to RestartPlayer.
+static VTABLE_DUMPED: AtomicBool = AtomicBool::new(false);
 
 fn tx() -> &'static Sender<StateEvent> {
     EVENT_TX.get().expect("EVENT_TX not initialized")
@@ -36,6 +42,65 @@ unsafe fn hook_restart_player(
 ) {
     // Call through first so the player is fully initialized when we read them
     RestartPlayer.call(this, controller);
+
+    // One-time vtable dump: walk this->vtable, find RestartPlayer's slot,
+    // then print ±20 neighbors so we can identify Logout and SetMatchState.
+    if !VTABLE_DUMPED.swap(true, Ordering::SeqCst) {
+        let base        = GameBase::singleton().at_offset(0) as usize;
+        let rp_addr     = GameBase::singleton().at_offset(0x233CE50) as usize;
+        let vtable      = *(this as *const *const usize);
+
+        println!("[match_tracker] === VTABLE DUMP ===");
+        println!("[match_tracker] base        = {:#x}", base);
+        println!("[match_tracker] RestartPlayer runtime addr = {:#x}  RVA = {:#x}", rp_addr, rp_addr.wrapping_sub(base));
+
+        // Find the RestartPlayer slot in the vtable.
+        let mut rp_slot: Option<usize> = None;
+        for i in 0..512usize {
+            let entry = *vtable.add(i);
+            if entry == 0 { break; }
+            if entry == rp_addr {
+                rp_slot = Some(i);
+                break;
+            }
+        }
+
+        match rp_slot {
+            None => println!("[match_tracker] RestartPlayer not found in first 512 vtable slots"),
+            Some(slot) => {
+                println!("[match_tracker] RestartPlayer is vtable[{}]", slot);
+                let lo = slot.saturating_sub(20);
+                let hi = slot + 20;
+                for i in lo..=hi {
+                    let entry = *vtable.add(i);
+                    let rva   = entry.wrapping_sub(base);
+                    let tag   = if i == slot { "  <-- RestartPlayer" } else { "" };
+                    println!("[match_tracker] vtable[{:3}] = {:#x}  RVA {:#010x}{}", i, entry, rva, tag);
+                }
+            }
+        }
+        println!("[match_tracker] === END VTABLE DUMP ===");
+
+        // Also write to a file since Wine stdout may not be captured.
+        {
+            let mut out = String::new();
+            let _ = writeln!(out, "base        = {:#x}", base);
+            let _ = writeln!(out, "RestartPlayer runtime addr = {:#x}  RVA = {:#x}", rp_addr, rp_addr.wrapping_sub(base));
+            if let Some(slot) = rp_slot {
+                let lo = slot.saturating_sub(20);
+                let hi = slot + 20;
+                for i in lo..=hi {
+                    let entry = *vtable.add(i);
+                    let rva   = entry.wrapping_sub(base);
+                    let tag   = if i == slot { "  <-- RestartPlayer" } else { "" };
+                    let _ = writeln!(out, "vtable[{:3}] = {:#x}  RVA {:#010x}{}", i, entry, rva, tag);
+                }
+            } else {
+                let _ = writeln!(out, "RestartPlayer not found in first 512 vtable slots");
+            }
+            let _ = std::fs::write("vtable_dump.txt", out);
+        }
+    }
 
     // Collect player data on the game thread — no background thread touches UE4 memory
     if let Some(game_mode) = GameMode::mode() {
