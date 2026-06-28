@@ -11,3 +11,6 @@ game_base = { workspace = true }
 ue_types = { workspace = true }
 utils = { workspace = true }
 retour = "0.1.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["libloaderapi"] }

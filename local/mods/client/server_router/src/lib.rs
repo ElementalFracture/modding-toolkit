@@ -1,12 +1,13 @@
 use std::ffi::c_void;
 use std::io::Write;
 use std::sync::{OnceLock, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use game_base::*;
 use ue_types::*;
 use ue_types::ue_endian::u32le;
 use retour::static_detour;
 
-// ── File logger (same pattern as auth_injector) ───────────────────────────────
+// ── File logger ───────────────────────────────────────────────────────────────
 
 static LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
@@ -30,7 +31,23 @@ fn init_log(log_path: std::path::PathBuf) {
     }
 }
 
-// ── HlString ──────────────────────────────────────────────────────────────────
+// ── Current mode (set by SetMode hook, read by sendto hook) ──────────────────
+
+// Stores the last mode char selected by the player: s/d/q/c/t/x.
+// 'x' = unknown / no selection yet.
+static CURRENT_MODE: AtomicU8 = AtomicU8::new(b'x');
+
+// True once the EFM control packet for the current mode has been sent.
+// Reset to false every time SetMode fires so each new mode triggers a fresh send.
+static EFM_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Called by auth_injector (or any other DLL in-process) to get the current mode.
+#[no_mangle]
+pub extern "C" fn get_current_mode() -> u8 {
+    CURRENT_MODE.load(Ordering::Relaxed)
+}
+
+// ── HlString (UE4 heap-allocated string) ─────────────────────────────────────
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C, align(0x8))]
@@ -48,120 +65,112 @@ impl std::fmt::Display for HlString {
     }
 }
 
-// ── Detour ────────────────────────────────────────────────────────────────────
+// ── Winsock sendto signature ──────────────────────────────────────────────────
+
+type SendToFn = fn(usize, *const u8, i32, i32, *const u8, i32) -> i32;
+
+// ── 2×-encoded join URL header ────────────────────────────────────────────────
+
+// "/Game/Maps/" with each byte doubled — used to identify join packets.
+const ENCODED_HEADER: &[u8] = &[94, 142, 194, 218, 202, 94, 154, 194, 224, 230, 94];
+
+// ── Detours ───────────────────────────────────────────────────────────────────
 
 static_detour! {
-    // HlString is 16 bytes; Windows x64 ABI passes structs >8 bytes by hidden
-    // pointer, so declare as *const HlString rather than HlString by value.
     static SetMode: fn(*const UGameInstance, *const HlString, *const HlString);
+    static SendTo:  fn(usize, *const u8, i32, i32, *const u8, i32) -> i32;
 }
 
-fn hook_set_mode(game_instance: *const UGameInstance, mode: *const HlString, variant: *const HlString) {
+// ── SetMode hook ──────────────────────────────────────────────────────────────
+
+fn hook_set_mode(
+    game_instance: *const UGameInstance,
+    mode:    *const HlString,
+    variant: *const HlString,
+) {
     if mode.is_null() {
-        log!("SetMode called with null mode ptr");
+        log!("SetMode: null mode ptr");
         SetMode.call(game_instance, mode, variant);
         return;
     }
 
     let mode_str = unsafe { (*mode).to_string() };
-    log!("SetMode: mode='{}'", mode_str);
-
-    let endpoint = load_endpoint_for_mode(&mode_str);
-    log!("endpoint -> {:?}", endpoint);
-
-    if let Some(ref ep) = endpoint {
-        let mode_char = mode_char_for(&mode_str);
-        write_commands_file("server_mode.txt",     &mode_char.to_string());
-        write_commands_file("server_endpoint.txt", ep);
-        log!("wrote server_mode.txt='{}' server_endpoint.txt='{}'", mode_char, ep);
-    }
+    let mode_char = mode_char_for(&mode_str);
+    CURRENT_MODE.store(mode_char as u8, Ordering::Relaxed);
+    // Reset so the next sendto call re-sends the EFM control packet.
+    EFM_NOTIFIED.store(false, Ordering::Relaxed);
+    log!("SetMode: mode='{}' → char='{}'", mode_str, mode_char as char);
 
     SetMode.call(game_instance, mode, variant);
 }
 
-// ── File helpers ──────────────────────────────────────────────────────────────
-
-fn commands_dir() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().unwrap_or_default();
-    p.pop(); // Win64
-    p.pop(); // Binaries
-    p.pop(); // g3
-    p.pop(); // install root
-    p.push("Mods");
-    p.push("commands");
-    p
-}
-
-fn dlls_dir() -> std::path::PathBuf {
-    let mut p = commands_dir();
-    p.pop();
-    p.push("dlls");
-    p
-}
-
-fn write_file(filename: &str, content: &str) {
-    let path = commands_dir().join(filename);
-    let _ = std::fs::write(&path, content);
-}
-
-fn write_commands_file(filename: &str, content: &str) {
-    let path = commands_dir().join(filename);
-    if let Err(e) = std::fs::write(&path, content) {
-        log!("failed to write {:?}: {}", path, e);
+fn mode_char_for(mode: &str) -> u8 {
+    match mode.to_lowercase().as_str() {
+        "solo"       => b's',
+        "duo"        => b'd',
+        "squad"      => b'q',
+        "rumblsquad" => b'q',
+        "capture"    => b'c',
+        "tdm"        => b't',
+        _            => b'x',
     }
 }
 
-fn load_endpoint_for_mode(mode: &str) -> Option<String> {
-    let path = commands_dir().join("server_routes.txt");
-    let content = std::fs::read_to_string(&path).ok()?;
-    let mode_lc = mode.to_lowercase();
-    let mut default_ep: Option<String> = None;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some((key, val)) = line.split_once('=') {
-            let key = key.trim().to_lowercase();
-            let val = val.trim().to_string();
-            if key == mode_lc   { return Some(val); }
-            if key == "default" { default_ep = Some(val); }
+// ── Sendto hook — sends EFM side-channel packet before first game packet ──────
+//
+// Instead of modifying the join URL (which corrupts UE4's FString length field
+// and causes "corrupted packet data" on the server), we send a tiny 5-byte
+// control packet "EFM:s" on the same socket and to the same destination as the
+// first outgoing game packet.  The router reads this, stores the mode preference
+// for the client IP, and routes the subsequent real handshake accordingly.
+// The join packet itself is forwarded completely unmodified.
+
+fn hook_sendto(
+    s:     usize,
+    buf:   *const u8,
+    len:   i32,
+    flags: i32,
+    to:    *const u8,
+    tolen: i32,
+) -> i32 {
+    if len > 0 && !buf.is_null() {
+        let mode = CURRENT_MODE.load(Ordering::Relaxed);
+        if mode != b'x' && mode != 0 {
+            // Send EFM once per mode change, on the first outgoing UDP packet.
+            if !EFM_NOTIFIED.swap(true, Ordering::Relaxed) {
+                let msg = format!("EFM:{}", mode as char);
+                let r = SendTo.call(
+                    s, msg.as_ptr() as *const u8, msg.len() as i32,
+                    flags, to, tolen,
+                );
+                log!("Sent EFM:{} control packet to router (result={})", mode as char, r);
+            }
         }
     }
-    default_ep
-}
-
-fn mode_char_for(mode: &str) -> char {
-    match mode.to_lowercase().as_str() {
-        "solo"  | "solos"              => 's',
-        "duo"   | "duos"               => 'd',
-        "squad" | "squads"             => 'q',
-        "rumblsquad" | "rumblsquads"   => 'q',
-        "capture"                      => 'c',
-        "tdm"                          => 't',
-        _                              => 'x',
-    }
+    // Always forward the original packet completely unmodified.
+    SendTo.call(s, buf, len, flags, to, tolen)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
 fn mod_main(base_addr: *const c_void) {
-    // Step 1: absolute-path write — no path computation, no other code.
     let _ = std::fs::write(
         "Z:\\var\\home\\doobs\\.local\\share\\Steam\\steamapps\\common\\Spellbreak\\Mods\\dlls\\sr_canary.txt",
-        b"v3 mod_main called",
+        b"v5 mod_main called",
     );
 
     GameBase::initialize("server_router", base_addr);
 
-    // Step 2: now compute the log path and init logging.
     init_log(dlls_dir().join("server_router.log"));
-    log!("server_router starting, base={:p}", base_addr);
+    log!("server_router v5 starting, base={:p}", base_addr);
 
     unsafe {
-        let fn_ptr: fn(*const UGameInstance, *const HlString, *const HlString) =
+        // SetMode hook — detect which game mode the player selected.
+        let set_mode_ptr: fn(*const UGameInstance, *const HlString, *const HlString) =
             std::mem::transmute(GameBase::singleton().at_offset(0x39910C0));
-        log!("SetMode fn_ptr={:p}", fn_ptr as *const ());
-        match SetMode.initialize(fn_ptr, hook_set_mode) {
+        log!("SetMode fn_ptr={:p}", set_mode_ptr as *const ());
+        match SetMode.initialize(set_mode_ptr, hook_set_mode) {
             Ok(_)  => {}
             Err(e) => { log!("SetMode.initialize failed: {}", e); return; }
         }
@@ -169,7 +178,45 @@ fn mod_main(base_addr: *const c_void) {
             Ok(_)  => log!("SetMode hook active"),
             Err(e) => { log!("SetMode.enable failed: {}", e); return; }
         }
+
+        // sendto hook — sends EFM side-channel control packet before first game packet.
+        #[cfg(windows)]
+        {
+            use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+            let ws2 = GetModuleHandleA(b"ws2_32.dll\0".as_ptr() as *const i8);
+            if ws2.is_null() {
+                log!("ws2_32.dll not loaded — sendto hook skipped");
+            } else {
+                let addr = GetProcAddress(ws2, b"sendto\0".as_ptr() as *const i8);
+                if addr.is_null() {
+                    log!("sendto not found in ws2_32.dll");
+                } else {
+                    let fn_ptr: SendToFn = std::mem::transmute(addr);
+                    match SendTo.initialize(fn_ptr, hook_sendto) {
+                        Ok(_)  => {}
+                        Err(e) => { log!("SendTo.initialize failed: {}", e); return; }
+                    }
+                    match SendTo.enable() {
+                        Ok(_)  => log!("sendto hook active — will send EFM side-channel on mode selection"),
+                        Err(e) => { log!("SendTo.enable failed: {}", e); return; }
+                    }
+                }
+            }
+        }
     }
 
     log!("mod_main done");
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+fn dlls_dir() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().unwrap_or_default();
+    p.pop(); // Win64
+    p.pop(); // Binaries
+    p.pop(); // g3
+    p.pop(); // install root
+    p.push("Mods");
+    p.push("dlls");
+    p
 }
