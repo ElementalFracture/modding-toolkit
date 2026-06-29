@@ -15,7 +15,7 @@ set "MOD_ZIP_URL=https://cdn.elefrac.com/patch/mod/mod.zip"
 set "AUTH_PORTAL=https://elefrac.com"
 
 set "LOADER_DLL=xinput1_3.dll"
-set "MOD_DLLS=auth_injector.dll devmenu_imgui.dll qt_devmenu.dll"
+set "MOD_DLLS=auth_injector.dll devmenu_imgui.dll qt_devmenu.dll server_router.dll"
 
 :: ==================================================================
 ::  GAME ROOT  --  this script lives in the Spellbreak folder
@@ -129,6 +129,13 @@ for %%F in (%MOD_DLLS%) do (
     )
 )
 
+if exist "!_pkg!\ef_server.txt" (
+    copy /Y "!_pkg!\ef_server.txt" "!GAME_PATH!\Mods\commands\ef_server.txt" >nul 2>&1
+    if !errorlevel! equ 0 (echo    [OK]       ef_server.txt) else (echo    [ERROR]    ef_server.txt)
+) else (
+    echo    [MISSING]  ef_server.txt - not in package
+)
+
 rmdir /s /q "!TMP_DIR!" 2>nul
 
 :: Remove the internet Zone.Identifier mark so Windows loads the DLLs without restriction.
@@ -166,6 +173,7 @@ call :REMOVE "!GAME_PATH!\g3\Binaries\Win64\xinput1_3.dll" "Mod loader (xinput1_
 for %%F in (!MOD_DLLS!) do (
     call :REMOVE "!GAME_PATH!\Mods\dlls\%%F" "%%F"
 )
+call :REMOVE "!GAME_PATH!\Mods\commands\ef_server.txt"    "Server address (ef_server.txt)"
 
 echo.
 echo  Uninstall complete.
@@ -241,6 +249,7 @@ for %%F in (!MOD_DLLS!) do (
     call :CHK "!GAME_PATH!\Mods\dlls\%%F"                  "%%F"
 )
 call :CHK "!GAME_PATH!\Mods\commands\auth_token.txt"        "Auth token"
+call :CHK "!GAME_PATH!\Mods\commands\ef_server.txt"         "Server address (ef_server.txt)"
 
 echo.
 echo  ------------------------------------------------------------

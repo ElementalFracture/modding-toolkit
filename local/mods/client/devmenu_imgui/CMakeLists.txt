@@ -43,6 +43,7 @@ target_link_libraries(devmenu_imgui PRIVATE
     dxgi
     d3dcompiler
     dwmapi
+    xinput
 )
 
 # Statically embed the MinGW C/C++ runtimes so the DLL has no external

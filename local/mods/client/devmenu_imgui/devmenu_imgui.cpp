@@ -12,6 +12,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
+#include <xinput.h>
 
 // ── Debug log ─────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,9 @@ extern "C" {
     __declspec(dllexport) void devmenu_set_command_callback(CommandDispatchFn cb);
     __declspec(dllexport) void devmenu_get_menu_key(unsigned *vk, unsigned *mods);
     __declspec(dllexport) void devmenu_set_menu_key_callback(MenuKeyChangedFn cb);
+    // Called by auth_injector when a token file is found at game launch,
+    // BEFORE connecting to any game server.  Shows a toast on first rendered frame.
+    __declspec(dllexport) void devmenu_token_loaded(const char *username, int is_staff, int is_dev);
 }
 
 // ── Auth / display state ──────────────────────────────────────────────────────
@@ -85,28 +89,71 @@ static void hk_heal();
 struct HotkeyDef {
     const char *label;
     void (*action)();
-    UINT vk;    // primary key (0 = unbound)
-    UINT mods;  // Shift=1, Ctrl=2, Alt=4
-    UINT vk2;   // optional second non-modifier key held simultaneously (0 = none)
+    UINT vk;         // keyboard primary (0 = unbound)
+    UINT mods;       // Shift=1, Ctrl=2, Alt=4
+    UINT vk2;        // chord key (0 = none)
+    WORD ctrl_btn;   // XInput button mask (0 = unbound)
+    BYTE ctrl_player;// XInput player index (0-3)
 };
 static HotkeyDef g_hotkeys[] = {
-    { "Drop Amulet",           hk_drop_amulet,    0, 0, 0 },
-    { "Drop Belt",             hk_drop_belt,      0, 0, 0 },
-    { "Drop Boots",            hk_drop_boots,     0, 0, 0 },
-    { "Drop Rune",             hk_drop_rune,      0, 0, 0 },
-    { "Drop Secondary Wep",    hk_drop_secondary, 0, 0, 0 },
-    { "Drop All (no primary)", hk_drop_all,       0, 0, 0 },
-    { "Heal",                  hk_heal,           0, 0, 0 },
+    { "Drop Amulet",           hk_drop_amulet,    0, 0, 0, 0, 0 },
+    { "Drop Belt",             hk_drop_belt,      0, 0, 0, 0, 0 },
+    { "Drop Boots",            hk_drop_boots,     0, 0, 0, 0, 0 },
+    { "Drop Rune",             hk_drop_rune,      0, 0, 0, 0, 0 },
+    { "Drop Secondary Wep",    hk_drop_secondary, 0, 0, 0, 0, 0 },
+    { "Drop All (no primary)", hk_drop_all,       0, 0, 0, 0, 0 },
+    { "Heal",                  hk_heal,           0, 0, 0, 0, 0 },
     // Must stay last — index is referenced by k_menu_key_idx.
     // action=nullptr: toggling is handled by the low-level keyboard hook in
     // qt_devmenu, not the WndProc hotkey loop.  vk2 is intentionally ignored
     // for this entry (LL hooks don't support chord keys).
-    { "Open / Close Menu",     nullptr,            0x77 /* F8 */, 0, 0 },
+    { "Open / Close Menu",     nullptr,            0x77 /* F8 */, 0, 0, 0, 0 },
 };
 static const int k_hotkey_count = (int)(sizeof(g_hotkeys) / sizeof(g_hotkeys[0]));
 static const int k_menu_key_idx = k_hotkey_count - 1;
-static int       g_listening_idx = -1;
+static int       g_listening_idx      = -1;  // keyboard listen
+static int       g_ctrl_listening_idx = -1;  // controller listen
+static WORD      g_ctrl_prev[4]       = {};  // previous XInput button state per player
 static void      save_hotkeys();  // defined after persistence helpers
+
+// XInput button definitions (including synthetic trigger masks 0x4000/0x8000).
+struct CtrlBtnDef { WORD mask; const char *name; };
+static const CtrlBtnDef k_ctrl_btns[] = {
+    { XINPUT_GAMEPAD_A,              "A"       },
+    { XINPUT_GAMEPAD_B,              "B"       },
+    { XINPUT_GAMEPAD_X,              "X"       },
+    { XINPUT_GAMEPAD_Y,              "Y"       },
+    { XINPUT_GAMEPAD_LEFT_SHOULDER,  "LB"      },
+    { XINPUT_GAMEPAD_RIGHT_SHOULDER, "RB"      },
+    { 0x4000,                        "LT"      },
+    { 0x2000,                        "RT"      },
+    { XINPUT_GAMEPAD_DPAD_UP,        "D-Up"    },
+    { XINPUT_GAMEPAD_DPAD_DOWN,      "D-Down"  },
+    { XINPUT_GAMEPAD_DPAD_LEFT,      "D-Left"  },
+    { XINPUT_GAMEPAD_DPAD_RIGHT,     "D-Right" },
+    { XINPUT_GAMEPAD_START,          "Start"   },
+    { XINPUT_GAMEPAD_BACK,           "Back"    },
+    { XINPUT_GAMEPAD_LEFT_THUMB,     "LS"      },
+    { XINPUT_GAMEPAD_RIGHT_THUMB,    "RS"      },
+};
+static const int k_ctrl_btn_count = (int)(sizeof(k_ctrl_btns) / sizeof(k_ctrl_btns[0]));
+
+static WORD xinput_sample(BYTE player)
+{
+    XINPUT_STATE st = {};
+    if (XInputGetState(player, &st) != ERROR_SUCCESS) return 0;
+    WORD b = st.Gamepad.wButtons;
+    if (st.Gamepad.bLeftTrigger  > 64) b |= 0x4000;
+    if (st.Gamepad.bRightTrigger > 64) b |= 0x2000;
+    return b;
+}
+
+static const char *ctrl_btn_name(WORD mask)
+{
+    for (int i = 0; i < k_ctrl_btn_count; ++i)
+        if (k_ctrl_btns[i].mask == mask) return k_ctrl_btns[i].name;
+    return "?";
+}
 
 // Callback invoked (from any thread) whenever the menu key binding changes.
 typedef void (*MenuKeyChangedFn)(unsigned vk, unsigned mods);
@@ -169,6 +216,12 @@ static LRESULT CALLBACK hooked_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     // unconditionally — Num Lock is not a bindable game key in Spellbreak.
     if (msg == WM_KEYDOWN && static_cast<UINT>(wp) == VK_NUMLOCK)
         return 0;
+
+    // Cancel controller-listen on Escape too.
+    if (msg == WM_KEYDOWN && static_cast<UINT>(wp) == VK_ESCAPE && g_ctrl_listening_idx >= 0) {
+        g_ctrl_listening_idx = -1;
+        return 0;
+    }
 
     // Key bind capture — highest priority, fires even when an input field has focus.
     // Only accepts whitelisted VK codes so synthetic engine events (e.g. VK_NUMLOCK)
@@ -431,17 +484,17 @@ static const PerkInfo k_mind_perks[] = {
 };
 static const int k_mind_count = 8;
 
-// Body tree — last entry (Vital Stone) is the No-Body talent.
+// Body tree.
 static const PerkInfo k_body_perks[] = {
     { "Tough",       "Tough",       1 },
-    { "Scavenging",  "Scavenging",  2 },
+    { "Scavenger",   "Scavenging",  2 },
     { "Thirsty",     "Thirsty",     2 },
-    { "Vigor",       "Vigor",       4 },
-    { "Vampiric",    "Vampiric",    3 },
     { "Fortitude",   "Fortitude",   3 },
-    { "Vital Stone", "Vital_Stone", 3 },  // No Body talent
-    { "Harmony",     "Harmony",     4 },
     { "Recovery",    "Recovery",    3 },
+    { "Vampiric",    "Vampiric",    3 },
+    { "Vital Stone", "Vital_Stone", 3 },
+    { "Harmony",     "Harmony",     4 },
+    { "Vigor",       "Vigor",       4 },
 };
 static const int k_body_count = 9;
 
@@ -451,9 +504,9 @@ static const PerkInfo k_spirit_perks[] = {
     { "Mystical",     "Mystical",     1 },
     { "Dexterity",    "Dexterity",    2 },
     { "Dilution",     "Tracking",     2 },
-    { "Wellspring",   "Wellspring",   2 },
-    { "Vivify",       "Athletic",     2 },
     { "Spellslinger", "Spellslinger", 2 },
+    { "Vivify",       "Athletic",     2 },
+    { "Wellspring",   "Wellspring",   2 },
     { "Recklessness", "Recklessness", 3 },
 };
 static const int k_spirit_count = 8;
@@ -535,6 +588,16 @@ static void spawn_boot(int idx, int amt)
     char buf[128];
     snprintf(buf, sizeof(buf), "SpawnBoot Loot:BP_Item_Boots_%s %d", k_boots[idx].cmd_key, amt);
     dispatch_ascii(buf);
+    // Named boots (non-generic-tier) don't auto-grant armor via the console command;
+    // apply it explicitly based on rarity so the pickup feels correct.
+    if (strncmp(k_boots[idx].cmd_key, "Tier_", 5) != 0) {
+        int armor = k_boots[idx].rarity;          // rarity 0=Common→0, 1=Uncommon→1, …, 4=Legendary→4
+        if (armor > 0) {
+            snprintf(buf, sizeof(buf),
+                "ApplyPlayerEffect GameplayEffect:BP_Effect_Player_Adjust_Armor %d", armor);
+            dispatch_ascii(buf);
+        }
+    }
 }
 
 static void spawn_belt(int idx, int amt)
@@ -562,8 +625,8 @@ struct Loadout {
     int  spirit_perk;
     int  level_ups;
     bool upgrade_mind, upgrade_body, upgrade_spirit;
-    char boss_cmd[256];
-    // v2 additions — old save files will mismatch sizeof and be discarded.
+    char boss_cmd[1024];
+    // v3 additions — old save files will mismatch sizeof and be discarded.
     bool has_primary_tier; // spawn primary gauntlet at a specific tier
     int  pri_tier;         // 0-4 (Common–Legendary)
     bool has_offhand2;     // second offhand gauntlet (Spellslinger / future default)
@@ -587,6 +650,8 @@ static void init_loadouts()
 {
     for (int i = 0; i < 10; ++i) reset_loadout_slot(i);
 }
+
+static const char *boss_cmd_find_dangerous(const char *cmd); // defined below
 
 static void apply_loadout(const Loadout &l)
 {
@@ -650,7 +715,139 @@ static void apply_loadout(const Loadout &l)
     if (l.upgrade_mind)   for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Mind");
     if (l.upgrade_body)   for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Body");
     if (l.upgrade_spirit) for (int i = 0; i < 3; ++i) dispatch_ascii("UpgradeCharacterPerk Spirit");
-    if (l.boss_cmd[0])    dispatch_ascii(l.boss_cmd);
+    if (l.boss_cmd[0] && !boss_cmd_find_dangerous(l.boss_cmd))
+        dispatch_ascii(l.boss_cmd);
+}
+
+// ── Boss command safety ───────────────────────────────────────────────────────
+
+static const char *k_boss_cmd_blocked[] = {
+    "God", "FastCooldowns", "ToggleHUD", "ToggleDebugCamera",
+    "SetNoMatchBotAggro", "Superspeed", nullptr,
+};
+
+// Returns the first blocked keyword found, or nullptr if the command is safe.
+static const char *boss_cmd_find_dangerous(const char *cmd)
+{
+    for (int i = 0; k_boss_cmd_blocked[i]; ++i) {
+        const char *kw = k_boss_cmd_blocked[i];
+        const char *p  = cmd;
+        while (*p) {
+            if (strncmp(p, kw, strlen(kw)) == 0) {
+                char after = p[strlen(kw)];
+                if (after == '\0' || after == ' ' || after == '\t')
+                    return kw;
+            }
+            ++p;
+        }
+    }
+    return nullptr;
+}
+
+// Parse a boss command string and apply recognisable loadout commands to l.
+// Handles ChooseCharacterClass, SpawnGauntlet, SpawnRune, SpawnAmulet, SpawnBoot,
+// SpawnBelt, and ChooseCharacterPerk directives.
+static void parse_boss_cmd_into_loadout(Loadout &l, const char *cmd)
+{
+    char tmp[1024]; strncpy(tmp, cmd, sizeof(tmp) - 1); tmp[sizeof(tmp)-1] = '\0';
+    char *tok = tmp;
+    while (*tok) {
+        // Skip whitespace / leading junk
+        while (*tok == ' ' || *tok == '\t') ++tok;
+        if (!*tok) break;
+        // Find end of "word" (first space after non-space)
+        char *end = tok;
+        while (*end && *end != ' ' && *end != '\t') ++end;
+        char saved = *end; *end = '\0';
+        const char *word = tok;
+        tok = end; if (saved) ++tok;
+
+        // Collect remainder of this logical command (until next recognised keyword)
+        // For simplicity: treat everything as one flat token stream.
+        // ChooseCharacterClass CharacterClass:BP_CharacterClass_<X>
+        if (strcmp(word, "ChooseCharacterClass") == 0) {
+            while (*tok == ' ') ++tok;
+            const char *pfx = "CharacterClass:BP_CharacterClass_";
+            if (strncmp(tok, pfx, strlen(pfx)) == 0) {
+                const char *cls = tok + strlen(pfx);
+                char *cend = tok; while (*cend && *cend != ' ') ++cend; *cend = '\0'; tok = cend + (*cend ? 1 : 0);
+                for (int i = 0; i < k_class_count; ++i) {
+                    if (strcmp(cls, k_classes[i]) == 0) { l.class_idx = i; break; }
+                }
+            }
+        }
+        // SpawnGauntlet Loot:BP_Item_Weapon_<ELEM>_Tier_<N>
+        else if (strcmp(word, "SpawnGauntlet") == 0) {
+            while (*tok == ' ') ++tok;
+            const char *pfx = "Loot:BP_Item_Weapon_";
+            if (strncmp(tok, pfx, strlen(pfx)) == 0) {
+                char piece[64]; strncpy(piece, tok + strlen(pfx), sizeof(piece)-1);
+                piece[sizeof(piece)-1] = '\0';
+                char *sp = strchr(piece, ' '); if (sp) *sp = '\0';
+                tok += strlen(pfx) + strlen(piece) + (sp ? 1 : 0);
+                // piece = "<ELEM>_Tier_<N>"
+                for (int i = 0; i < k_elem_count; ++i) {
+                    size_t elen = strlen(k_elements[i].cmd);
+                    if (strncmp(piece, k_elements[i].cmd, elen) == 0 && piece[elen] == '_') {
+                        int tier = atoi(piece + elen + strlen("Tier_")) - 1;
+                        if (tier >= 0 && tier <= 4) {
+                            if (!l.has_offhand) {
+                                l.has_offhand = true; l.off_elem = i; l.off_tier = tier;
+                            } else if (!l.has_offhand2) {
+                                l.has_offhand2 = true; l.off2_elem = i; l.off2_tier = tier;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // SpawnRune Loot:BP_Item_Rune_<X>[_Tier_<N>]
+        else if (strcmp(word, "SpawnRune") == 0) {
+            while (*tok == ' ') ++tok;
+            const char *pfx = "Loot:BP_Item_Rune_";
+            if (strncmp(tok, pfx, strlen(pfx)) == 0) {
+                char piece[64]; strncpy(piece, tok + strlen(pfx), sizeof(piece)-1);
+                piece[sizeof(piece)-1] = '\0';
+                char *sp = strchr(piece, ' '); if (sp) *sp = '\0';
+                tok += strlen(pfx) + strlen(piece) + (sp ? 1 : 0);
+                for (int i = 0; i < k_rune_count; ++i) {
+                    size_t rlen = strlen(k_runes[i].cmd);
+                    if (strncmp(piece, k_runes[i].cmd, rlen) == 0 &&
+                        (piece[rlen] == '\0' || piece[rlen] == '_')) {
+                        l.has_rune = true; l.rune_idx = i;
+                        if (k_runes[i].has_tier) {
+                            const char *tp = strstr(piece + rlen, "Tier_");
+                            l.rune_tier = tp ? atoi(tp + 5) - 1 : 4;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // ChooseCharacterPerk CharacterPerk:BP_Perk_<X>
+        else if (strcmp(word, "ChooseCharacterPerk") == 0) {
+            while (*tok == ' ') ++tok;
+            const char *pfx = "CharacterPerk:BP_Perk_";
+            if (strncmp(tok, pfx, strlen(pfx)) == 0) {
+                char piece[64]; strncpy(piece, tok + strlen(pfx), sizeof(piece)-1);
+                piece[sizeof(piece)-1] = '\0';
+                char *sp = strchr(piece, ' '); if (sp) *sp = '\0';
+                tok += strlen(pfx) + strlen(piece) + (sp ? 1 : 0);
+                bool found = false;
+                for (int i = 0; i < k_mind_count && !found; ++i)
+                    if (strcmp(piece, k_mind_perks[i].cmd) == 0) { l.mind_perk = i; found = true; }
+                for (int i = 0; i < k_body_count && !found; ++i)
+                    if (strcmp(piece, k_body_perks[i].cmd) == 0) { l.body_perk = i; found = true; }
+                for (int i = 0; i < k_spirit_count && !found; ++i)
+                    if (strcmp(piece, k_spirit_perks[i].cmd) == 0) { l.spirit_perk = i; found = true; }
+            }
+        }
+        else {
+            // Unknown word — skip to next space (it's an argument of something already processed)
+            while (*tok && *tok != ' ') ++tok;
+        }
+    }
 }
 
 // ── Per-section state ─────────────────────────────────────────────────────────
@@ -677,8 +874,12 @@ static int  s_body_perk_active   = -1;
 static int  s_spirit_perk_active = -1;
 
 // Staff
-static bool  s_allow_round_end = true;
-static bool  s_no_aggro        = false;
+static bool  s_god_mode           = false;
+static bool  s_fast_cooldowns     = false;
+static bool  s_toggle_hud         = false;
+static bool  s_toggle_debug_cam   = false;
+static bool  s_allow_round_end    = true;
+static bool  s_no_aggro           = false;
 static float s_superspeed      = 1.0f;
 static int   s_arena_idx       = 0;
 static int   s_friend_pts      = 100;
@@ -721,7 +922,7 @@ static void draw_match()
 {
     if (!ImGui::BeginTable("##match", 2, ImGuiTableFlags_None)) return;
     ImGui::TableSetupColumn("lbl",  ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthStretch);
 
     ImGui::TableNextRow();
     bool sel0 = row(0, "Start Match");
@@ -945,9 +1146,10 @@ static void draw_items()
     }
 
     // ── Add Perk (tree-based with cost tracking) ──
-    // Reset then re-apply ALL trees so switching one perk doesn't clobber the others.
+    // Auto-applies as soon as the combo selection changes.  Resets all trees
+    // first so switching one perk never clobbers the others.
     auto perk_add_row = [&](int row_idx, const char *tree_lbl,
-                             const char *combo_id, const char *btn_id,
+                             const char *combo_id,
                              const PerkInfo *perks, int count,
                              int &sel_idx, int &active_idx, int tree_idx) {
         ImGui::TableNextRow();
@@ -957,10 +1159,9 @@ static void draw_items()
         const char *names[12];
         for (int i = 0; i < count; ++i) names[i] = perks[i].display;
 
-        ImGui::SetNextItemWidth(-65.0f);
-        ImGui::Combo(combo_id, &sel_idx, names, count);
-        ImGui::SameLine();
-        if (ImGui::Button(btn_id, ImVec2(-1, 0)) || (sel && kbd_enter(row_idx))) {
+        ImGui::SetNextItemWidth(-1.0f);
+        bool changed = ImGui::Combo(combo_id, &sel_idx, names, count);
+        if (changed || (sel && kbd_enter(row_idx))) {
             dispatch_ascii("ResetCharacterPerks");
             const PerkInfo *all_trees[] = { k_mind_perks, k_body_perks, k_spirit_perks };
             int all_active[] = { s_mind_perk_active, s_body_perk_active, s_spirit_perk_active };
@@ -977,11 +1178,11 @@ static void draw_items()
         }
     };
 
-    perk_add_row(8,  "Mind Perk",   "##prkm", "Add##pm",
+    perk_add_row(8,  "Mind Perk",   "##prkm",
                  k_mind_perks,   k_mind_count,   s_mind_perk_idx,   s_mind_perk_active, 0);
-    perk_add_row(9,  "Body Perk",   "##prkb", "Add##pb",
+    perk_add_row(9,  "Body Perk",   "##prkb",
                  k_body_perks,   k_body_count,   s_body_perk_idx,   s_body_perk_active, 1);
-    perk_add_row(10, "Spirit Perk", "##prks", "Add##ps",
+    perk_add_row(10, "Spirit Perk", "##prks",
                  k_spirit_perks, k_spirit_count, s_spirit_perk_idx, s_spirit_perk_active, 2);
 
     // ── Points tracker — derived from active perks, not accumulated ──
@@ -1065,9 +1266,11 @@ static void save_hotkeys()
         int n = k_hotkey_count;
         fwrite(&n, sizeof(n), 1, f);
         for (int i = 0; i < k_hotkey_count; ++i) {
-            fwrite(&g_hotkeys[i].vk,   sizeof(UINT), 1, f);
-            fwrite(&g_hotkeys[i].mods, sizeof(UINT), 1, f);
-            fwrite(&g_hotkeys[i].vk2,  sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].vk,          sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].mods,        sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].vk2,         sizeof(UINT), 1, f);
+            fwrite(&g_hotkeys[i].ctrl_btn,    sizeof(WORD), 1, f);
+            fwrite(&g_hotkeys[i].ctrl_player, sizeof(BYTE), 1, f);
         }
         fclose(f);
     } else {
@@ -1097,11 +1300,20 @@ static void load_hotkeys()
     if (!f) return;
     int n = 0;
     if (fread(&n, sizeof(n), 1, f) != 1) { fclose(f); return; }
+    // Detect format by file size: old=12 bytes/entry (vk+mods+vk2), new=19 bytes/entry (+ctrl_btn+ctrl_player)
+    long file_sz = 0;
+    if (fseek(f, 0, SEEK_END) == 0) file_sz = ftell(f);
+    rewind(f); fread(&n, sizeof(n), 1, f);  // re-read count after rewind
+    bool has_ctrl = (file_sz >= (long)(sizeof(int) + n * (3*sizeof(UINT) + sizeof(WORD) + sizeof(BYTE))));
     int to_load = n < k_hotkey_count ? n : k_hotkey_count;
     for (int i = 0; i < to_load; ++i) {
         fread(&g_hotkeys[i].vk,   sizeof(UINT), 1, f);
         fread(&g_hotkeys[i].mods, sizeof(UINT), 1, f);
         fread(&g_hotkeys[i].vk2,  sizeof(UINT), 1, f);
+        if (has_ctrl) {
+            fread(&g_hotkeys[i].ctrl_btn,    sizeof(WORD), 1, f);
+            fread(&g_hotkeys[i].ctrl_player, sizeof(BYTE), 1, f);
+        }
     }
     fclose(f);
 }
@@ -1147,7 +1359,7 @@ static void draw_char()
 {
     if (!ImGui::BeginTable("##char", 2, ImGuiTableFlags_None)) return;
     ImGui::TableSetupColumn("lbl",  ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthStretch);
 
     auto drop_row = [&](int idx, const char *lbl, const char *btn_id, const char *cmd) {
         ImGui::TableNextRow();
@@ -1207,58 +1419,127 @@ static void draw_hotkeys()
     ImGui::TextDisabled("Bound keys fire when the menu is closed.  Esc cancels binding.");
     ImGui::Spacing();
 
-    if (!ImGui::BeginTable("##hktbl", 3, ImGuiTableFlags_BordersInnerH)) return;
-    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthFixed, 90.0f);
-    ImGui::TableSetupColumn("##btns", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-    ImGui::TableHeadersRow();
+    if (!ImGui::BeginTabBar("##hktabs")) return;
 
-    for (int i = 0; i < k_hotkey_count; ++i) {
-        // Visual separator between game-command hotkeys and the menu toggle.
-        if (i == k_menu_key_idx) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Spacing();
-            ImGui::TextDisabled("-- Menu --");
-            ImGui::Spacing();
-        }
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextUnformatted(g_hotkeys[i].label);
+    // ── Keyboard tab ──────────────────────────────────────────────────────────
+    if (ImGui::BeginTabItem("Keyboard")) {
+        if (ImGui::BeginTable("##hktbl", 3, ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("##btns", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableHeadersRow();
 
-        ImGui::TableSetColumnIndex(1);
-        bool listening = (g_listening_idx == i);
-        if (listening) {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 50, 255));
-            ImGui::TextUnformatted("(press key...)");
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::TextUnformatted(hotkey_label(g_hotkeys[i]));
-        }
+            for (int i = 0; i < k_hotkey_count; ++i) {
+                if (i == k_menu_key_idx) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Spacing(); ImGui::TextDisabled("-- Menu --"); ImGui::Spacing();
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(g_hotkeys[i].label);
 
-        ImGui::TableSetColumnIndex(2);
-        char bind_id[16], clr_id[16];
-        snprintf(bind_id, sizeof(bind_id), "Bind##hk%d",  i);
-        snprintf(clr_id,  sizeof(clr_id),  "Clear##hk%d", i);
-        if (listening) {
-            ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(120, 80, 0, 255));
-            ImGui::Button(bind_id, ImVec2(50, 0));
-            ImGui::PopStyleColor();
-        } else {
-            if (ImGui::Button(bind_id, ImVec2(50, 0)))
-                g_listening_idx = i;
+                ImGui::TableSetColumnIndex(1);
+                bool listening = (g_listening_idx == i);
+                if (listening) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 50, 255));
+                    ImGui::TextUnformatted("(press key...)");
+                    ImGui::PopStyleColor();
+                } else {
+                    ImGui::TextUnformatted(hotkey_label(g_hotkeys[i]));
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                char bind_id[20], clr_id[20];
+                snprintf(bind_id, sizeof(bind_id), "Bind##kbhk%d",  i);
+                snprintf(clr_id,  sizeof(clr_id),  "Clear##kbhk%d", i);
+                if (listening) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(120, 80, 0, 255));
+                    ImGui::Button(bind_id, ImVec2(50, 0));
+                    ImGui::PopStyleColor();
+                } else {
+                    if (ImGui::Button(bind_id, ImVec2(50, 0))) {
+                        g_ctrl_listening_idx = -1;
+                        g_listening_idx = i;
+                    }
+                }
+                ImGui::SameLine(0, 4);
+                ImGui::BeginDisabled(g_hotkeys[i].vk == 0);
+                if (ImGui::Button(clr_id, ImVec2(-1, 0))) {
+                    g_hotkeys[i].vk = 0; g_hotkeys[i].mods = 0; g_hotkeys[i].vk2 = 0;
+                    if (g_listening_idx == i) g_listening_idx = -1;
+                    save_hotkeys();
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::EndTable();
         }
-        ImGui::SameLine(0, 4);
-        ImGui::BeginDisabled(g_hotkeys[i].vk == 0);
-        if (ImGui::Button(clr_id, ImVec2(-1, 0))) {
-            g_hotkeys[i].vk = 0; g_hotkeys[i].mods = 0; g_hotkeys[i].vk2 = 0;
-            if (g_listening_idx == i) g_listening_idx = -1;
-            save_hotkeys();
-        }
-        ImGui::EndDisabled();
+        ImGui::EndTabItem();
     }
 
-    ImGui::EndTable();
+    // ── Controller tab ────────────────────────────────────────────────────────
+    if (ImGui::BeginTabItem("Controller")) {
+        ImGui::TextDisabled("Requires an XInput (Xbox) controller.  Esc cancels binding.");
+        ImGui::Spacing();
+
+        if (ImGui::BeginTable("##ctrltbl", 3, ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Action",  ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Button",  ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("##cbtns", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < k_hotkey_count; ++i) {
+                if (!g_hotkeys[i].action) continue;  // Skip menu-open entry
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(g_hotkeys[i].label);
+
+                ImGui::TableSetColumnIndex(1);
+                bool clistening = (g_ctrl_listening_idx == i);
+                if (clistening) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 50, 255));
+                    ImGui::TextUnformatted("(press...)");
+                    ImGui::PopStyleColor();
+                } else if (g_hotkeys[i].ctrl_btn) {
+                    char lbl[32];
+                    snprintf(lbl, sizeof(lbl), "P%d: %s",
+                             g_hotkeys[i].ctrl_player + 1,
+                             ctrl_btn_name(g_hotkeys[i].ctrl_btn));
+                    ImGui::TextUnformatted(lbl);
+                } else {
+                    ImGui::TextDisabled("(none)");
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                char bind_id[20], clr_id[20];
+                snprintf(bind_id, sizeof(bind_id), "Bind##chk%d",  i);
+                snprintf(clr_id,  sizeof(clr_id),  "Clear##chk%d", i);
+                if (clistening) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(120, 80, 0, 255));
+                    ImGui::Button(bind_id, ImVec2(50, 0));
+                    ImGui::PopStyleColor();
+                } else {
+                    if (ImGui::Button(bind_id, ImVec2(50, 0))) {
+                        g_listening_idx = -1;
+                        g_ctrl_listening_idx = i;
+                    }
+                }
+                ImGui::SameLine(0, 4);
+                ImGui::BeginDisabled(g_hotkeys[i].ctrl_btn == 0);
+                if (ImGui::Button(clr_id, ImVec2(-1, 0))) {
+                    g_hotkeys[i].ctrl_btn    = 0;
+                    g_hotkeys[i].ctrl_player = 0;
+                    if (g_ctrl_listening_idx == i) g_ctrl_listening_idx = -1;
+                    save_hotkeys();
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
 }
 
 // ── Section: Loadouts ─────────────────────────────────────────────────────────
@@ -1486,6 +1767,19 @@ static void draw_loadouts()
     ImGui::TextUnformatted("Boss Command (optional — dispatched last on Apply):");
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputText("##lboss", l.boss_cmd, sizeof(l.boss_cmd));
+    // Warn if the field contains dangerous commands that will be blocked on Apply.
+    if (l.boss_cmd[0]) {
+        const char *bad = boss_cmd_find_dangerous(l.boss_cmd);
+        if (bad) {
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 60, 255));
+            ImGui::TextUnformatted("  WARNING: blocked command detected (will not execute):");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(bad);
+            ImGui::PopStyleColor();
+        }
+    }
+    if (ImGui::SmallButton("Parse → Loadout##lbparse") && l.boss_cmd[0])
+        parse_boss_cmd_into_loadout(l, l.boss_cmd);
 
     // ── Action buttons ──
     ImGui::Spacing();
@@ -1520,7 +1814,7 @@ static void draw_staff()
 
     if (!ImGui::BeginTable("##staff", 2, ImGuiTableFlags_None)) return;
     ImGui::TableSetupColumn("lbl",  ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+    ImGui::TableSetupColumn("ctrl", ImGuiTableColumnFlags_WidthStretch);
 
     auto btn = [&](int idx, const char *lbl, const char *cmd) {
         ImGui::TableNextRow();
@@ -1552,8 +1846,8 @@ static void draw_staff()
         ImGui::Spacing();
     };
 
-    btn(0, "God Mode",            "God");
-    btn(1, "Fast Cooldowns",      "FastCooldowns");
+    tog(0, "God Mode",            s_god_mode,           "God", "God");
+    tog(1, "Fast Cooldowns",      s_fast_cooldowns,     "FastCooldowns", "FastCooldowns");
     btn(2, "Die",                 "Die");
 
     ImGui::TableNextRow();
@@ -1567,8 +1861,8 @@ static void draw_staff()
         dispatch_ascii(buf);
     }
 
-    btn(4, "Toggle HUD",          "ToggleHUD");
-    btn(5, "Toggle Debug Camera", "ToggleDebugCamera");
+    tog(4, "Toggle HUD",          s_toggle_hud,         "ToggleHUD", "ToggleHUD");
+    tog(5, "Toggle Debug Camera", s_toggle_debug_cam,   "ToggleDebugCamera", "ToggleDebugCamera");
     btn(6, "Switch Team",         "SwitchTeam");
 
     ImGui::TableNextRow();
@@ -2004,6 +2298,43 @@ static void handle_nav_keys()
     }
 }
 
+// ── Controller polling ────────────────────────────────────────────────────────
+
+static void poll_controller()
+{
+    for (BYTE p = 0; p < 4; ++p) {
+        WORD cur      = xinput_sample(p);
+        WORD pressed  = cur & ~g_ctrl_prev[p];
+        g_ctrl_prev[p] = cur;
+        if (!pressed) continue;
+
+        // Pick the single highest-priority bit that was newly pressed.
+        WORD single = 0;
+        for (int j = 0; j < k_ctrl_btn_count && !single; ++j)
+            if (pressed & k_ctrl_btns[j].mask) single = k_ctrl_btns[j].mask;
+        if (!single) continue;
+
+        if (g_ctrl_listening_idx >= 0) {
+            g_hotkeys[g_ctrl_listening_idx].ctrl_btn    = single;
+            g_hotkeys[g_ctrl_listening_idx].ctrl_player = p;
+            g_ctrl_listening_idx = -1;
+            save_hotkeys();
+            continue;
+        }
+
+        // Fire hotkeys bound to this controller button (only when menu is closed).
+        if (!g_show.load()) {
+            for (int i = 0; i < k_hotkey_count; ++i) {
+                if (!g_hotkeys[i].action)             continue;
+                if (!g_hotkeys[i].ctrl_btn)           continue;
+                if (g_hotkeys[i].ctrl_btn    != single) continue;
+                if (g_hotkeys[i].ctrl_player != p)    continue;
+                g_hotkeys[i].action();
+            }
+        }
+    }
+}
+
 // ── ImGui render ──────────────────────────────────────────────────────────────
 
 static void render_frame()
@@ -2014,6 +2345,7 @@ static void render_frame()
 
     ImGui::GetIO().MouseDrawCursor = true;
 
+    poll_controller();
     handle_nav_keys();
 
     char title[320];
@@ -2321,11 +2653,18 @@ static DWORD WINAPI wndproc_install_thread(LPVOID)
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+        InitializeCriticalSection(&g_state_cs);
+    else if (reason == DLL_PROCESS_DETACH)
+        DeleteCriticalSection(&g_state_cs);
+    return TRUE;
+}
+
 extern "C" void devmenu_init()
 {
     dbg("devmenu_init: start");
-    InitializeCriticalSection(&g_state_cs);
-    dbg("devmenu_init: InitializeCriticalSection done");
     init_loadouts();
     dbg("devmenu_init: init_loadouts done");
     load_loadouts();
@@ -2391,10 +2730,11 @@ extern "C" void devmenu_hide()
 
 extern "C" void devmenu_set_staff(int is_staff, int is_dev, const char *username)
 {
-    g_is_staff.store(is_staff != 0);
-    g_is_dev.store(is_dev != 0);
     EnterCriticalSection(&g_state_cs);
     if (username && username[0]) {
+        // Valid auth response — update everything.
+        g_is_staff.store(is_staff != 0);
+        g_is_dev.store(is_dev != 0);
         strncpy(g_username, username, sizeof(g_username) - 1);
         g_username[255] = '\0';
         // Prepare toast text; hooked_present will start the countdown once
@@ -2408,7 +2748,12 @@ extern "C" void devmenu_set_staff(int is_staff, int is_dev, const char *username
                      "Connected as %s  [%s]", username, role);
         }
         g_auth_received.store(true, std::memory_order_release);
-    } else {
+    } else if (!g_auth_received.load(std::memory_order_relaxed)) {
+        // No-auth response and no prior auth — clear everything.
+        // If devmenu_token_loaded or a previous EF_AUTH already ran,
+        // don't evict that state (e.g. REQUIRE_AUTH=false on the server).
+        g_is_staff.store(false);
+        g_is_dev.store(false);
         g_username[0] = '\0';
     }
     LeaveCriticalSection(&g_state_cs);
@@ -2417,4 +2762,27 @@ extern "C" void devmenu_set_staff(int is_staff, int is_dev, const char *username
 extern "C" void devmenu_set_command_callback(CommandDispatchFn cb)
 {
     g_command_cb = cb;
+}
+
+extern "C" void devmenu_token_loaded(const char *username, int is_staff, int is_dev)
+{
+    // Pre-auth from server at game launch — update auth state and queue toast.
+    // The toast timer is started on the first rendered frame (hooked_present),
+    // so it shows in the game world rather than during the loading screen.
+    g_is_staff.store(is_staff != 0);
+    g_is_dev.store(is_dev != 0);
+    EnterCriticalSection(&g_state_cs);
+    if (username && username[0]) {
+        strncpy(g_username, username, sizeof(g_username) - 1);
+        g_username[255] = '\0';
+        if (!g_toast_shown.load(std::memory_order_relaxed)) {
+            const char *role = is_dev  ? "Developer"
+                             : is_staff ? "Staff"
+                                        : "Player";
+            snprintf(g_toast_text, sizeof(g_toast_text),
+                     "Authenticated as %s  [%s]", username, role);
+        }
+        g_auth_received.store(true, std::memory_order_release);
+    }
+    LeaveCriticalSection(&g_state_cs);
 }

@@ -25,7 +25,7 @@ COMPONENT="${1:-all}"
 
 build_rust() {
     echo "==> Building Rust client mod DLLs in ${DISTROBOX}…"
-    distrobox-run --name "${DISTROBOX}" -- bash -lc "
+    distrobox-enter --name "${DISTROBOX}" -- bash -lc "
         set -euo pipefail
         cd '${SCRIPT_DIR}'
         '${CARGO_BIN}' build --release 2>&1
@@ -35,7 +35,7 @@ build_rust() {
 
 build_imgui() {
     echo "==> Building devmenu_imgui.dll in ${DISTROBOX}…"
-    distrobox-run --name "${DISTROBOX}" -- bash -lc "
+    distrobox-enter --name "${DISTROBOX}" -- bash -lc "
         set -euo pipefail
         cd '${IMGUI_DIR}'
         bash build_mingw.sh 2>&1
